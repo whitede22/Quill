@@ -1,0 +1,13 @@
+# 统一行尾为 LF。
+#
+# 本项目全部源码按 LF 书写，而 Windows 上 git 默认会把检出后的文本翻成 CRLF——
+# 「行尾统一为 LF」这条断言因此会假红（本项目真踩过：变异脚本用 write_text
+# 落地，换行被顺手改坏，触发了这条断言，自证于是「看着抓住了、其实抓错了」）。
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换，也避免被当成文本做 diff。
+*.png binary
+*.ico binary
+*.db binary
+*.ttf binary
+*.otf binary

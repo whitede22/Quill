@@ -1,0 +1,28 @@
+# ---------- 虚拟环境 ----------
+.venv/
+
+# ---------- 打包产物 ----------
+# build.py 会重建；重打包前会把上一份备份成 *_old_<时间戳>，一并忽略。
+build/
+build_old_*/
+dist/
+dist_old_*/
+
+# ---------- Python 缓存 ----------
+__pycache__/
+*.py[cod]
+
+# ---------- 本工具写出的自检快照（内含本机绝对路径，不该进版本库） ----------
+selfcheck_result.txt
+
+# ---------- Qt 应用启动时显卡驱动在本目录留下的日志 ----------
+NVIDIA Corporation/
+
+# ---------- 离线词库的构建源数据（ECDICT 原始库，上百 MB，只用于生成 assets/offline_dict.db） ----------
+_ecdict_src/
+
+# ---------- 系统 / 编辑器噪声 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
