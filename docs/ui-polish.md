@@ -9,7 +9,7 @@
 > 「面板要让位」这件事为什么是必需的。
 >
 > 起因：用户提出「做一下美化吧，有什么建议吗」。诊断依据是五张真实预览图
-> （`preview_main.png` / `preview_incomplete.png` / `preview_fallback.png` /
+> （`preview.png` / `preview_incomplete.png` / `preview_fallback.png` /
 > `preview_settings.png` / `preview_import.png`），不是凭空建议。
 
 ## 一、诊断：问题不在配色
@@ -240,10 +240,10 @@ QUILL_SHOT_KIND=fallback .venv/Scripts/python.exe scripts/screenshot.py preview_
 
 1. **P0-1 提示块** → 重生成 `preview_fallback.png` 与 `preview_incomplete.png`，
    肉眼确认提示块不裁字、描边看得见
-2. **P0-2 工具栏三级** → 重生成 `preview_main.png`
-3. **P0-3 × 淡化** → 重生成 `preview_main.png`
+2. **P0-2 工具栏三级** → 重生成 `preview.png`
+3. **P0-3 × 淡化** → 重生成 `preview.png`
 4. **P1-1 / P1-2 / P1-3** → 逐项重生成对应图
-5. **P2 各项**（如果要做）→ 重生成 `preview_settings.png` 与 `preview_main.png`
+5. **P2 各项**（如果要做）→ 重生成 `preview_settings.png` 与 `preview.png`
 6. 最后一轮完整回归
 
 **每步的验收条件**（Round 25 实测口径，含二次返工后的计数）：
