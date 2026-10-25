@@ -64,6 +64,7 @@ from ..providers.base import provided_fields, provider_label
 from ..security.keystore import load_api_key
 from .background import BackgroundRenderer
 from .export_dialog import EXPORT_FORMATS, ExportDialog, FormatHelpDialog
+from .refresh_dialog import RefreshDialog
 from .review_dialog import ReviewDialog
 from .settings import SettingsDialog
 from .theme import BG_VEIL_DEFAULT, stylesheet, theme_id_of, veil_level
@@ -117,12 +118,19 @@ def _dismiss_progress(progress: QProgressDialog) -> None:
     结果框、事件循环跑起来，它才消失。**「导入完成却卡在 100%，要过一会才能关掉」
     的成因就在这几行之间**，而不是进度本身没跑完。
 
-    所以这里补一次 `processEvents`，并且**排除用户输入**：
+    所以这里补 `processEvents`，并且**排除用户输入**：
 
     - 不排除的话，用户在这几毫秒里再点一次「导入」会重入 `_do_import`——
       此刻 `_import_progress` 已置 None，它会开一轮新导入，与正在收尾的这一轮
       抢列表状态；
     - 排除之后，窗口系统照样处理隐藏与重绘，而这正是要解决的那一件事。
+
+    两次而不是一次：一次 `processEvents` 处理的是**隐藏**，紧接着还要处理一次
+    重绘——屏幕上那块残留的 100% 只有在重绘之后才真的消失。两次的代价是微秒级。
+
+    `hide()` 与 `close()` 都给：`hide()` 是明确的「从屏幕上撤掉」，`close()` 走的
+    是 QDialog 的关闭流程。单靠 `close()` 时，模态关系与嵌套事件循环都可能把
+    hide 推迟到下一个循环——而那正是用户抱怨的那一段。
 
     顺带把「取消」按钮摘掉：`canceled` 已经在上面断开（`setValue(maximum)` 会让
     `QProgressDialog` 自己补发一次 canceled，而此刻我们已经在收尾了），
@@ -134,10 +142,13 @@ def _dismiss_progress(progress: QProgressDialog) -> None:
         pass
     progress.setCancelButton(None)
     progress.setValue(progress.maximum())
+    progress.setEnabled(False)
+    progress.hide()
     progress.close()
     app = QApplication.instance()
     if app is not None:
-        app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        for _ in range(2):
+            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
 
 def _brief(text: str, limit: int = 44) -> str:
@@ -221,6 +232,18 @@ class MainWindow(QMainWindow):
         # 批量查词走的是与导入同一条链路，但把结果说成「导入完成」会让用户
         # 以为程序自己去读了个文件。
         self._import_origin = "导入"
+
+        # 批量重查状态。与导入那套分开记：一次重查每条都要一次接口往返，
+        # 没法按批合并；而且两者的「失败」含义完全不同——导入的失败是
+        # 「这个词没进来」，重查的失败是「这一条保持原样」。混用一套计数，
+        # 报告里就会把这两种事说成同一件。
+        self._refresh_queue: list[tuple[int, str]] = []
+        self._refresh_total = 0
+        self._refresh_done = 0
+        self._refresh_updated: list[int] = []
+        self._refresh_kept: list[tuple[str, str]] = []
+        self._refresh_cancelled = False
+        self._refresh_progress: QProgressDialog | None = None
 
         self.setWindowTitle("Quill · 英语生词本")
         self.resize(1080, 700)
@@ -573,10 +596,21 @@ class MainWindow(QMainWindow):
             "开始复习到期词条：正面看词、翻面看义，再按「忘了 / 模糊 / 记住了」"
             "评分推进记忆计划"
         )
+        # 「重查全部」与「待复习」同处一行、左右分列：两者都是「拿当前这一栏
+        # 的内容做一件事」，放在一起比塞进顶部工具栏更贴近它们的作用范围。
+        self.btn_refresh_all = QPushButton("重查全部")
+        self.btn_refresh_all.setObjectName("refresh")
+        self.btn_refresh_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_refresh_all.setToolTip(
+            "按当前接口把列表里的词条重新查一遍。已写的备注与标签保留，"
+            "接口没答上来的词条保持原样。"
+        )
+
         review_row = QHBoxLayout()
         review_row.setSpacing(6)
         review_row.addWidget(self.btn_review)
         review_row.addStretch(1)
+        review_row.addWidget(self.btn_refresh_all)
 
         left_layout.addLayout(mode_row)
         left_layout.addLayout(review_row)
@@ -657,6 +691,7 @@ class MainWindow(QMainWindow):
             lambda _=False: self._switch_mode(MODE_PHRASES)
         )
         self.btn_review.clicked.connect(self._open_review)
+        self.btn_refresh_all.clicked.connect(self._do_refresh_all)
 
         # 输入即搜，但需要防抖，避免每个字符都打一次数据库
         self._filter_timer = QTimer(self)
@@ -714,6 +749,9 @@ class MainWindow(QMainWindow):
         words = self._mode == MODE_WORDS
         self.btn_mode_words.setChecked(words)
         self.btn_mode_phrases.setChecked(not words)
+        # 重查只对词条有意义：词组是用户从固定搭配里收下来的，没有接口内容，
+        # 也没有「过时」这回事。切到词组模式就藏起来，别留一个点了没反应的按钮。
+        self.btn_refresh_all.setVisible(words)
         self.filter.setPlaceholderText(
             "搜索生词本（支持中文）" if words else "搜索词组收藏"
         )
@@ -1003,6 +1041,21 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         self._flush_edits()
         self._save_state()
+        # 导入 / 重查正跑到一半被关窗口：进度框是 `self` 的 WindowModal 子窗口，
+        # 父窗口关掉之后它可能留在屏幕上——而到那时已经没有任何东西能把它的状态
+        # 收回来，用户看到的就是一个「关不掉的 100%」。先取消，再把框撤掉。
+        #
+        # 这里不走 `_dismiss_progress`：那个函数会跑一次 processEvents，而在
+        # closeEvent 里再进一次事件循环，等于在关闭过程中触发重绘与回调。
+        self._import_cancelled = True
+        self._refresh_cancelled = True
+        for attr in ("_import_progress", "_refresh_progress"):
+            progress = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if progress is not None:
+                progress.setCancelButton(None)
+                progress.hide()
+                progress.close()
         super().closeEvent(event)
 
     # ---------- 查询 ----------
@@ -1028,8 +1081,10 @@ class MainWindow(QMainWindow):
         text = self.input.text().strip()
         if not text:
             return
-        if self._import_progress is not None:
-            # 批量查词与文件导入共用同一条队列与 id 快照，同时在飞会互相抢。
+        if self._import_progress is not None or self._refresh_progress is not None:
+            # 批量查词与文件导入共用同一条队列与 id 快照，同时在飞会互相抢；
+            # 批量重查虽自成一套，但它也在同一张表上连续写，混进来同样会把
+            # 进度与报告搅乱。
             QMessageBox.information(self, "查询", "上一批还在处理，请稍等片刻。")
             return
         words = split_words(text)
@@ -1074,6 +1129,11 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_word(self, word: str) -> None:
+        if self._refresh_progress is not None:
+            # 批量正在跑：同一条词条被两条路径同时写，最终留下谁的内容取决于
+            # 谁后到，而界面上完全看不出差别。等这一轮结束再单独重查。
+            self.statusBar().showMessage("正在批量重查，请等这一轮结束再单独重查")
+            return
         # 重新查询会用接口内容整条覆盖，压在内存里的备注必须先落盘，
         # 否则回填时库里根本没有值可保留
         self._flush_edits()
@@ -1179,6 +1239,255 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage("查询失败")
         QMessageBox.warning(self, "查询失败", message)
+
+    # ---------- 批量重查 ----------
+    # 详情区那条「重新查询」解决的是「这一条结果不理想」；接上接口之后真正要
+    # 处理的是另一件事：整本生词本是离线词库攒下来的，现在全都要换成接口内容。
+    # 逐个点的问题不是慢，而是**点了也没法知道查到哪儿了、还剩多少**。
+
+    def _refresh_blocked_reason(self) -> str:
+        """当前来源不足以支撑「重查」时返回一句说明，否则返回空串。
+
+        判据必须看**真实生效的 provider**，不能看 `config["provider"]`：接口模式下
+        没配密钥时，`build_provider()` 会静默退回离线词库，而 config 里仍然写着
+        "openai-compat"。按 config 判的话，一键重查会一路跑完，逐条把接口内容
+        换成离线内容——那是**降级覆盖**，而且不可撤销。
+        """
+        name = str(getattr(self.service.provider, "name", "") or "")
+        if name == "offline":
+            return (
+                "当前用的是本机离线词库，没有可以重新获取的来源。\n\n"
+                "先到右上角「设置」接上接口，词条才有更完整的内容可拿。"
+            )
+        if name == "mock":
+            return (
+                "当前是离线示例模式，只有几个演示词条，重查也拿不到真实内容。\n\n"
+                "先到右上角「设置」接上接口。"
+            )
+        return ""
+
+    def _do_refresh_all(self) -> None:
+        if self._import_progress is not None or self._refresh_progress is not None:
+            QMessageBox.information(self, "重新查询", "上一批还在处理，请稍等片刻。")
+            return
+        if self._mode != MODE_WORDS:
+            # 按钮在词组模式下是隐藏的，正常点不到；这条挡的是程序化路径
+            # （测试、快捷键、将来的右键菜单），以及隐藏之前已经排进队列的那一次。
+            QMessageBox.information(
+                self,
+                "重新查询",
+                "词组收藏是从固定搭配里收下来的，没有接口内容可以重查。",
+            )
+            return
+        blocked = self._refresh_blocked_reason()
+        if blocked:
+            QMessageBox.information(self, "重新查询", blocked)
+            return
+        # 批量重查会用接口内容整条覆盖内容字段。压在防抖里还没落库的备注与
+        # 标签必须先写进去，否则回填时库里没有值可保留，那就是静默丢失。
+        self._flush_edits()
+        rows = self._refresh_candidates()
+        if not rows:
+            QMessageBox.information(self, "重新查询", "当前列表里没有可重查的词条。")
+            return
+
+        outdated = [row for row in rows if row[2]]
+        dialog = RefreshDialog(
+            total=len(rows),
+            outdated=len(outdated),
+            scope=self._refresh_scope(),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = outdated if dialog.only_outdated else rows
+        if not chosen:
+            return
+        self._start_refresh([(entry_id, lemma) for entry_id, lemma, _ in chosen])
+
+    def _refresh_candidates(self) -> list[tuple[int, str, bool]]:
+        """当前列表的 (id, 词形, 是否需要更新)。
+
+        范围与列表完全一致：`_current_entries()` 同时管着搜索、标签筛选与排序，
+        重查跟着它走，所以「看到的」就是「会被重查的」。
+
+        上限必须放开（`unlimited=True`）：`LIST_LIMIT` 是**渲染**上限，不是重查
+        范围的上限。沿用它会静默漏掉第 1001 条以后的词条，而进度条按漏掉之后的
+        总数走完，看上去还「完成」了——少查的部分没有任何痕迹。
+        """
+        rows: list[tuple[int, str, bool]] = []
+        for entry in self._current_entries(unlimited=True):
+            if not entry.id:
+                continue
+            # 「需要更新」= 内容来自本机离线词库（含接口失败后的兜底），或由旧版
+            # 提示词生成。这两种都能靠接口重查变好；已经是接口内容的则大概率
+            # 只会拿到同一份结果，白白消耗额度。
+            outdated = (entry.source or "") == "offline" or self.service.is_stale(entry)
+            rows.append((entry.id, entry.lemma, outdated))
+        return rows
+
+    def _refresh_scope(self) -> str:
+        """一句话说清这次会动到哪一批，用在对话框那句「重新查询…」里。"""
+        query = self.filter.text().strip()
+        if self._tag_filter and query:
+            return f"标签「{self._tag_filter}」里搜索「{query}」命中的词条"
+        if self._tag_filter:
+            return f"带标签「{self._tag_filter}」的词条"
+        if query:
+            return f"搜索「{query}」命中的词条"
+        return "生词本里的全部词条"
+
+    def _start_refresh(self, rows: list[tuple[int, str]]) -> None:
+        self._refresh_queue = list(rows)
+        self._refresh_total = len(rows)
+        self._refresh_done = 0
+        self._refresh_updated = []
+        self._refresh_kept = []
+        self._refresh_cancelled = False
+
+        progress = QProgressDialog(
+            "正在重新查询…", "取消", 0, self._refresh_total, self
+        )
+        progress.setWindowTitle("重新查询")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        # 与导入不同，这里第一条就要一次接口往返（秒级起步），进度框必须立刻
+        # 出现：让它等 500ms 才冒出来，用户先看到的是「按钮点了没反应」。
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.canceled.connect(self._cancel_refresh)
+        progress.setValue(0)
+        self._refresh_progress = progress
+        self._next_refresh()
+
+    def _cancel_refresh(self) -> None:
+        # 只置标志：正在飞的那一条回来后会看到它，不再发下一条。从这里直接拆
+        # 队列，等于和正在执行的回调抢着收尾。
+        self._refresh_cancelled = True
+        progress = self._refresh_progress
+        if progress is not None:
+            # 与导入同理：不立刻反馈的话，用户点完取消看到的是「原样不动」。
+            progress.setLabelText("正在停止，等这一条结束…")
+            progress.setCancelButton(None)
+
+    def _next_refresh(self) -> None:
+        """发一条、等它回来、再发下一条。
+
+        刻意串行，不并发：接口一般按请求数计费，也有频率限制；一次撒出去几十个
+        并发请求，换来的是「快一点」和一堆 429，以及一个没法按顺序解释的失败清单。
+        """
+        if self._refresh_cancelled or not self._refresh_queue:
+            self._finish_refresh()
+            return
+        _entry_id, lemma = self._refresh_queue.pop(0)
+        progress = self._refresh_progress
+        if progress is not None:
+            progress.setLabelText(
+                f"正在重新查询「{lemma}」…"
+                f"（{self._refresh_done + 1}/{self._refresh_total}）"
+            )
+        # `accept_fallback=False`：接口这次没答上来的词条抛错而不是拿兜底内容，
+        # 于是它保持原样。批量跑几十条时没人盯得住每一条，这个判定必须由程序做。
+        submit(
+            self.service.refresh,
+            lemma,
+            accept_fallback=False,
+            on_success=self._on_refresh_one_ok,
+            on_error=lambda message, word=lemma: self._on_refresh_one_kept(
+                message, word
+            ),
+        )
+
+    def _on_refresh_one_ok(self, entry) -> None:
+        # refresh 返回单个 Entry（与 lookup 的元组契约不同，接错会抛 TypeError）
+        self._refresh_updated.append(entry.id)
+        self._advance_refresh()
+
+    def _on_refresh_one_kept(self, message: str, word: str) -> None:
+        """这一条没换掉：内容、备注、标签全都还在库里，只是这一轮没更新。"""
+        self._refresh_kept.append((word, message))
+        self._advance_refresh()
+
+    def _advance_refresh(self) -> None:
+        self._refresh_done += 1
+        progress = self._refresh_progress
+        if progress is not None:
+            progress.setValue(min(self._refresh_done, self._refresh_total))
+        self._next_refresh()
+
+    def _finish_refresh(self) -> None:
+        progress, self._refresh_progress = self._refresh_progress, None
+        if progress is not None:
+            _dismiss_progress(progress)
+
+        updated = set(self._refresh_updated)
+        keep = self._displayed_id
+        self._reload_list(select_id=keep)
+        # 详情区那条若正好被重查过，必须重读一遍再渲染：`_reload_list(select_id=…)`
+        # 会程序化选中它，而 `_on_item_changed` 看到 id 没变就直接返回——少了这一步，
+        # 屏幕上留着的还是重查前的旧内容，看上去像重查没生效。
+        if keep is not None and keep in updated:
+            fresh = self.repo.get_by_id(keep)
+            if fresh is not None:
+                self._displayed_id = keep
+                self._show_entry(self.service.mark_stale(fresh))
+        self._report_refresh()
+
+    def _report_refresh(self) -> None:
+        if not self.isVisible():
+            # 与 `_report_import` 同理：关窗口途中不该再弹结果框。
+            return
+        total = self._refresh_total
+        done = self._refresh_done
+        ok = len(self._refresh_updated)
+        kept = self._refresh_kept
+        stopped = self._refresh_cancelled
+
+        bits = [f"更新 {ok} 条"]
+        if kept:
+            bits.append(f"保持原样 {len(kept)} 条")
+        if stopped:
+            bits.append(f"未处理 {total - done} 条")
+        self.statusBar().showMessage(
+            f"重新查询{'已停止' if stopped else '完成'} · " + " · ".join(bits)
+        )
+
+        # 一切顺利就不弹窗打断：结果已经在列表与状态栏里。用户要的是「一键」，
+        # 不是「一键之后再点一次确定」。
+        if not (stopped or kept):
+            return
+
+        lines: list[str] = []
+        if stopped:
+            lines.append(f"已停止，还有 {total - done} 条没处理。已经更新的不会撤销。")
+            lines.append("")
+        lines.append(f"更新 {ok} 条 · 保持原样 {len(kept)} 条")
+        if kept:
+            lines.append("")
+            lines.append("保持原样（接口这次没返回可用内容）：")
+            for word, why in kept[:8]:
+                lines.append(f"　{word} — {_brief(why)}")
+            extra = len(kept) - 8
+            if extra > 0:
+                saved = self._save_refresh_kept_list(kept)
+                lines.append(f"　……另有 {extra} 条")
+                if saved is not None:
+                    lines.append(f"\n完整清单已写入：\n{saved}")
+
+        QMessageBox.information(self, "重新查询结果", "\n".join(lines))
+
+    @classmethod
+    def _save_refresh_kept_list(cls, kept: list[tuple[str, str]]) -> Path | None:
+        """把「这一轮没更新」的词条连同原因写下来。
+
+        只说「有 5 条没更新」等于把问题丢回去：既不知道是哪几个，也没法拿这份
+        清单到别处补查。
+        """
+        return cls._save_report(
+            "refresh_kept",
+            f"# 重新查询时接口未返回可用内容的词条（共 {len(kept)} 条）",
+            [f"{word}\t{why}" for word, why in kept],
+        )
 
     # ---------- 词条操作 ----------
 
@@ -1386,7 +1695,7 @@ class MainWindow(QMainWindow):
     # 那些词是用户刚亲手打的，没有「认错了」这回事。
 
     def _do_import(self) -> None:
-        if self._import_progress is not None:
+        if self._import_progress is not None or self._refresh_progress is not None:
             # 进度框要等 minimumDuration 才会显示，在那之前窗口并不模态，
             # 用户完全来得及再点一次「导入」。两条导入线同时写库会互相
             # 抢 id 快照，报告里的「新增 / 已存在」也就不成立了。
@@ -1583,6 +1892,15 @@ class MainWindow(QMainWindow):
         # 只置标志。正在飞的那一批会在词与词之间看到它，批次之间也会；
         # 从这里直接把队列拆掉，等于和正在执行的回调抢着收尾。
         self._import_cancelled = True
+        progress = self._import_progress
+        if progress is None:
+            return
+        # 光是置标志的话，界面在接下来这一批跑完之前**一动不动**：接口模式下
+        # 那是 10 个词、几十秒。用户点完取消，看到进度值停住、按钮还在，读到的
+        # 结论就是「取消没用、这框关不掉」。所以立刻给出受理反馈，并把按钮摘掉，
+        # 让它不可能被再点一次。
+        progress.setLabelText("正在停止，等这一批结束…")
+        progress.setCancelButton(None)
 
     def _next_import_batch(self) -> None:
         if self._import_cancelled or not self._import_queue:
@@ -1627,6 +1945,15 @@ class MainWindow(QMainWindow):
 
         self._reload_list(select_id=self._focus_after_import())
         self._report_import()
+        # 报告读完这一轮的计数之后把它们清干净。窗口不会为下一次导入重建，这些
+        # 字段会一直挂着上一轮的数字——任何读它们的地方（调试、日志、将来的功能）
+        # 都会把旧数字当成这一轮的结果。`_import_outcome` 刻意留着：它承载的是
+        # 「刚刚这一批干了什么」，本来就该在报告之后还能查。
+        self._import_queue.clear()
+        self._import_total = 0
+        self._import_done = 0
+        self._import_cancelled = False
+        self._import_error = ""
 
     def _focus_after_import(self) -> int | None:
         """批量查词结束后，把详情区切到刚收进来的第一条。
@@ -1641,6 +1968,10 @@ class MainWindow(QMainWindow):
         return entry.id if entry else None
 
     def _report_import(self) -> None:
+        if not self.isVisible():
+            # 窗口已经在关闭途中：状态栏没人看，模态框还会在关掉之后弹出来。
+            # 收尾该做的事（重载列表、清状态）上面已经做完，这里只是不报告。
+            return
         outcome = self._import_outcome
         bits = [f"新增 {len(outcome.added)} 条"]
         if outcome.existing:

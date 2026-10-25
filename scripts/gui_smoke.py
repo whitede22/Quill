@@ -120,10 +120,54 @@ class PickyProvider:
         )
 
 
+class FallbackingProvider:
+    """接口对指定词失败、由离线词库接住的形态。
+
+    `accept_fallback=False` 要拦的正是这一种：内容拿得到，但来源是离线词库，
+    写进去等于把这一条从接口内容**降级**。它与「Provider 直接抛错」是两条
+    不同的失败路径，前者连错误都不会传到界面。
+    """
+
+    name = "openai-compat"
+
+    def __init__(self, offline_words: set[str]) -> None:
+        self.offline_words = offline_words
+        self.calls: list[str] = []
+
+    def lookup(self, word: str) -> Entry:
+        self.calls.append(word)
+        if word in self.offline_words:
+            return Entry(
+                lemma=word,
+                definition_en="offline body",
+                definition_zh="兜底释义",
+                source="offline",
+                fallback_reason="请求超时（30 秒）",
+            )
+        return Entry(
+            lemma=word,
+            definition_en=f"fresh {word}",
+            definition_zh=f"{word} 的新释义",
+        )
+
+
 results: dict = {}
 # 跨阶段传递（finalize 发起重查，check_refresh 校验结果）
 refresh_target: dict = {}
 
+
+class OfflineStubProvider:
+    """真实生效的 provider 是离线词库。
+
+    与 `config["provider"]` 无关——这正是关键：接口模式下没配密钥时，
+    `build_provider()` 会静默退回离线词库，而 config 里仍写着
+    "openai-compat"。判重查能不能跑，必须看这个 `name`。
+    """
+
+    name = "offline"
+
+    def lookup(self, word: str) -> Entry:
+        return Entry(lemma=word, definition_en="offline body", definition_zh="兜底释义")
 
 def _match(expectation, actual) -> bool:
     """比对单项观测。expectation 可以是具体值，也可以是判定函数。"""
@@ -510,6 +554,14 @@ EXPECT: dict = {
     # 下面两条直接验**收尾动作本身**，它们才有能力失败。
     "收尾时进度框被真正撤掉": True,
     "收尾补了排除用户输入的事件处理": True,
+    # 另外两条「框留在屏幕上」的路径：点取消之后没有受理反馈（进度值停住、
+    # 按钮还在，读起来就是「点了没用」），以及在导入途中关掉窗口（父窗口没了，
+    # WindowModal 子窗口留在屏幕上，再没有任何东西能收回它的状态）。
+    "导入取消立刻给出反馈": True,
+    "关窗口时导入进度框一起撤掉": True,
+    # 收尾之后计数必须归零：窗口不会为下一次导入重建，残留的数字会被
+    # 后来的读者当成这一轮的结果。
+    "导入完成后导入状态已复位": True,
     "docx 端到端导入": True,
     # 定时器回调里抛异常，Qt 只把 traceback 打到 stderr 就继续跑，**不会**让
     # 进程失败——等着 app.quit() 的测试于是挂到外层超时，看起来像环境抽风。
@@ -577,6 +629,35 @@ EXPECT: dict = {
     "批量查词的报告口径不是「导入」": (
         lambda v: isinstance(v, str) and v.startswith("批量查词完成")
     ),
+    # ---- 一键重查 ----
+    # 这两条成对：「离线内容要算待更新」与「接口内容不算」缺一条，「只重查需要
+    # 更新的」就可能退化成「全库重跑」或「一条都不查」，而两种都不会报错。
+    "重查把离线来的内容标为待更新": True,
+    "重查不把已是接口内容的标为待更新": True,
+    # 范围跟着搜索框走：左栏看到的是哪些，被重查的就是哪些
+    "重查范围跟随筛选": "搜索「rr」命中的词条",
+    "重查只对需要更新的给出条数": 2,
+    "重查只把需要更新的交给批量": 2,
+    "重查跳过已是接口内容的词条": True,
+    "重查把成功那条换成接口内容": True,
+    "重查保留备注与标签": True,
+    # 核心保护：接口这次没答上来（这里是兜底接住了）的那条必须保持原样。
+    # 与「换成接口内容」成对——只有前者能过说明什么都没写，只有后者能过
+    # 说明兜底内容把这条覆盖掉了。
+    "重查让兜底的词条保持原样": True,
+    "重查失败清单只含兜底那一条": ["rrfallback"],
+    "重查报告口径": (
+        lambda v: isinstance(v, str)
+        and v.startswith("重新查询完成")
+        and "更新 1 条" in v
+        and "保持原样 1 条" in v
+    ),
+    # 离线来源下发起的重查必须被拒绝，并说明出路（去设置里接上接口）。
+    # 判据看的是**真实 provider**：config 写着接口模式、实际却退回离线词库时，
+    # 同样要拒绝——否则一键重查会把接口内容逐条降级成离线内容。
+    "接口模式但实际用离线词库时重查被拒绝": True,
+    "词组模式下重查被拒绝": True,
+    "词组模式下重查按钮隐藏": True,
     "撤销按钮在删除后出现": True,
     "撤销把词条放回来了（含备注与标签）": True,
     # 反例：代码注释里曾声称「SQLite 会把删掉的行号分给下一个新词条」，
@@ -1423,10 +1504,63 @@ def main() -> int:
             mw.QApplication = real_app_cls
 
         results["收尾时进度框被真正撤掉"] = not dlg.isVisible()
+        # 两次：一次处理 hide，一次处理重绘。屏幕上那块残留的 100% 只有重绘之后
+        # 才真的消失——只 hide 不重绘，用户看到的还是原来那一帧。
         results["收尾补了排除用户输入的事件处理"] = (
-            len(pumps) == 1
-            and pumps[0] == QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+            len(pumps) == 2
+            and all(p == QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents for p in pumps)
         )
+
+        # 取消必须**立刻**有反应。只置 `_import_cancelled` 的话，界面在接下来
+        # 这一批跑完之前一动不动：接口模式下那是 10 个词、几十秒。用户看到进度
+        # 值停住、按钮还在，读到的结论就是「取消没用、这个框关不掉」。
+        cancel_probe = QProgressDialog("正在导入…", "取消", 0, 10, window)
+        cancel_probe.setAutoClose(False)
+        cancel_probe.setAutoReset(False)
+        cancel_probe.setValue(3)
+        cancel_probe.show()
+        app.processEvents()
+        buttons_before = [
+            b for b in cancel_probe.findChildren(QPushButton) if b.isVisible()
+        ]
+        window._import_progress = cancel_probe
+        window._cancel_import()
+        app.processEvents()
+        buttons_after = [
+            b for b in cancel_probe.findChildren(QPushButton) if b.isVisible()
+        ]
+        results["导入取消立刻给出反馈"] = (
+            len(buttons_before) >= 1
+            and len(buttons_after) == 0
+            and "正在停止" in cancel_probe.labelText()
+            and window._import_cancelled
+        )
+        window._import_progress = None
+        window._import_cancelled = False
+        cancel_probe.hide()
+        cancel_probe.deleteLater()
+
+        # 导入跑到一半被关窗口：进度框是窗口的 WindowModal 子对象，父窗口没了
+        # 之后它会留在屏幕上，而那时已经没有任何东西能收回它的状态——用户看到的
+        # 就是一个「关不掉的 100%」。单独开一个窗口来验，主窗口还要继续用。
+        closer = MainWindow(repo, service, config)
+        closer.show()
+        orphan = QProgressDialog("正在导入…", "取消", 0, 10, closer)
+        orphan.setAutoClose(False)
+        orphan.setAutoReset(False)
+        orphan.setValue(10)
+        orphan.show()
+        app.processEvents()
+        orphan_was_visible = orphan.isVisible()
+        closer._import_progress = orphan
+        closer.close()
+        app.processEvents()
+        results["关窗口时导入进度框一起撤掉"] = (
+            orphan_was_visible
+            and not orphan.isVisible()
+            and closer._import_progress is None
+        )
+        closer.deleteLater()
 
         # 老师的 Word 单词表：真造一份 .docx（zip + word/document.xml）走同一条
         # 导入链路。这条验的是「读得出」；「选得到、拖得进」由后缀表与过滤器
@@ -1441,6 +1575,15 @@ def main() -> int:
             mw.QMessageBox = real_box
         results["docx 端到端导入"] = bool(
             repo.get("echozulu") is not None and repo.get("foxtrot") is not None
+        )
+        # 收尾之后这一轮的计数必须清干净：窗口不会为下一次导入重建，这些字段会
+        # 一直挂着上一轮的数字，任何读它们的地方都会把旧数字当成这一轮的结果。
+        results["导入完成后导入状态已复位"] = (
+            window._import_total == 0
+            and window._import_done == 0
+            and not window._import_queue
+            and window._import_cancelled is False
+            and window._import_error == ""
         )
         export_stage()
 
@@ -2078,6 +2221,10 @@ def main() -> int:
 
         home = Path(os.environ["QUILL_HOME"])
 
+        # 阶段标记不是调试残留：离屏会话里一旦弹出真的模态框，脚本会静止且
+        # 没有任何输出（实测卡过一次，9 分钟才被外部超时发现）。留着它，
+        # 下次卡住能一眼看出停在哪一段。
+        print("  INFO  阶段 ① 标签落库", flush=True)
         # ---------- ① 标签：详情区输入框 → 落库（并归一成存储形态） ----------
         # 自己种一条：不从「列表里恰好有什么」碰运气，场景才有确定性。
         probe = repo.upsert(
@@ -2104,6 +2251,7 @@ def main() -> int:
             stored is not None and stored.tags == "回归练习 高频"
         )
 
+        print("  INFO  阶段 ② 标签筛选", flush=True)
         # ---------- ② 标签筛选：下拉里列出库里的标签，选了就收窄 ----------
         window._refresh_tag_filter()
         app.processEvents()
@@ -2142,6 +2290,7 @@ def main() -> int:
             window._tag_filter == "" and window.list.count() == repo.count()
         )
 
+        print("  INFO  阶段 ③ 批量查词", flush=True)
         # ---------- ③ 批量查词：一串词走导入链路，整串本身不当成一个词条 ----------
         window.service.set_provider(PickyProvider())
         batch_before = repo.count()
@@ -2162,6 +2311,172 @@ def main() -> int:
         )
         results["批量查词的报告口径不是「导入」"] = window.statusBar().currentMessage()
 
+        print("  INFO  阶段 ③b 一键重查", flush=True)
+        # ---------- ③b 一键重查：成功的换掉、兜底的保持原样 ----------
+        #
+        # 这是**覆盖写**。不拦兜底内容的话，一次网络抖动就能把已经拿到的接口
+        # 内容换成离线内容，而且不可撤销。所以两条相反的结果必须同时验到：
+        # 只验「更新了」的话，把 `accept_fallback=False` 拿掉照样通过。
+        #
+        # 范围用筛选限定到 rr*：既避免把前面场景的数据一起改掉，也正好验了
+        # 「重查范围跟随当前筛选」这条设计。
+        import app.ui.main_window as mw
+
+        fallback_provider = FallbackingProvider({"rrfallback"})
+        window.service.set_provider(fallback_provider)
+        # rrfresh 走一次真查询：它要带着**当前**提示词版本入库，才能验
+        # 「已经是接口内容的不该被标成待更新」。
+        window.service.lookup("rrfresh")
+        repo.upsert(
+            Entry(
+                lemma="rrgood",
+                definition_en="旧内容",
+                definition_zh="旧内容",
+                source="offline",
+                notes="我的备注",
+                tags="考研",
+            )
+        )
+        repo.upsert(
+            Entry(
+                lemma="rrfallback",
+                definition_en="旧内容",
+                definition_zh="该保留",
+                source="offline",
+            )
+        )
+        window.filter.setText("rr")
+        window._reload_list()
+        candidates = {
+            word: outdated for _id, word, outdated in window._refresh_candidates()
+        }
+        results["重查把离线来的内容标为待更新"] = (
+            candidates.get("rrgood") is True
+            and candidates.get("rrfallback") is True
+        )
+        results["重查不把已是接口内容的标为待更新"] = (
+            candidates.get("rrfresh") is False
+        )
+
+        real_refresh_dialog = mw.RefreshDialog
+        real_box = mw.QMessageBox
+        notices: list[str] = []
+
+        class _AutoRefreshDialog:
+            seen: dict = {}
+
+            def __init__(self, *, total, outdated, scope, parent=None):
+                _AutoRefreshDialog.seen = {
+                    "total": total,
+                    "outdated": outdated,
+                    "scope": scope,
+                }
+
+            def exec(self):  # noqa: A003
+                return QDialog.DialogCode.Accepted
+
+            # 走「只重查需要更新的」这一支：它才是接上接口之后默认会走的路，
+            # 而且能用「rrfresh 有没有被调用」反过来验过滤真的生效了。
+            only_outdated = True
+
+        class _QuietBox:
+            StandardButton = real_box.StandardButton
+
+            @staticmethod
+            def information(*args, **kwargs):
+                notices.append(args[2] if len(args) > 2 else "")
+
+            @staticmethod
+            def warning(*args, **kwargs):
+                notices.append(args[2] if len(args) > 2 else "")
+
+            @staticmethod
+            def question(*args, **kwargs):
+                return real_box.StandardButton.Yes
+
+        mw.RefreshDialog = _AutoRefreshDialog
+        mw.QMessageBox = _QuietBox
+        fallback_provider.calls.clear()
+        # **`QMessageBox` 的打桩必须一直留到这一整段结束**：后面那两次「被拒绝」
+        # 也走 `QMessageBox.information`，而离屏会话里没人能点掉一个真的模态框
+        # ——提前恢复会让脚本永久停在那一句上，且没有任何输出（实测卡过一轮）。
+        try:
+            window._do_refresh_all()
+        finally:
+            mw.RefreshDialog = real_refresh_dialog
+
+        deadline = time.monotonic() + 20
+        while window._refresh_progress is not None and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        app.processEvents()
+
+        refreshed = repo.get("rrgood")
+        untouched = repo.get("rrfallback")
+        results["重查范围跟随筛选"] = _AutoRefreshDialog.seen.get("scope")
+        results["重查只对需要更新的给出条数"] = _AutoRefreshDialog.seen.get("outdated")
+        results["重查只把需要更新的交给批量"] = window._refresh_total
+        results["重查跳过已是接口内容的词条"] = "rrfresh" not in fallback_provider.calls
+        results["重查把成功那条换成接口内容"] = bool(
+            refreshed is not None and refreshed.definition_en == "fresh rrgood"
+        )
+        results["重查保留备注与标签"] = bool(
+            refreshed is not None
+            and refreshed.notes == "我的备注"
+            and refreshed.tags == "考研"
+        )
+        results["重查让兜底的词条保持原样"] = bool(
+            untouched is not None and untouched.definition_en == "旧内容"
+        )
+        results["重查失败清单只含兜底那一条"] = [
+            word for word, _why in window._refresh_kept
+        ]
+        results["重查报告口径"] = window.statusBar().currentMessage()
+
+        # 判据必须看**真实 provider**，不是 config：接口模式下没配密钥时，
+        # `build_provider()` 会静默退回离线词库，而 config 里仍写着
+        # "openai-compat"。第二条才是真正的反例——按 config 判，它不会被拒绝，
+        # 于是一键重查会一路跑完，逐条把接口内容换成离线内容。
+        window.service.set_provider(OfflineStubProvider())
+        notices.clear()
+        window.config["provider"] = "offline"
+        window._do_refresh_all()
+        blocked_offline = (
+            window._refresh_progress is None
+            and bool(notices)
+            and "离线词库" in notices[0]
+        )
+        notices.clear()
+        window.config["provider"] = "openai-compat"
+        window._do_refresh_all()
+        results["接口模式但实际用离线词库时重查被拒绝"] = (
+            blocked_offline
+            and window._refresh_progress is None
+            and bool(notices)
+            and "离线词库" in notices[0]
+        )
+        window.config["provider"] = "mock"
+
+        window.filter.clear()
+        window._reload_list()
+        window.service.set_provider(PickyProvider())
+
+        # 词组模式下重查必须被拒绝：词组是从固定搭配里收下来的，没有接口内容。
+        # 按钮本身在这一模式下是隐藏的，所以这条挡的是程序化路径。
+        window._switch_mode(mw.MODE_PHRASES)
+        notices.clear()
+        window._do_refresh_all()
+        results["词组模式下重查被拒绝"] = (
+            window._refresh_progress is None
+            and bool(notices)
+            and "词组" in notices[0]
+        )
+        results["词组模式下重查按钮隐藏"] = not window.btn_refresh_all.isVisible()
+        window._switch_mode(mw.MODE_WORDS)
+        app.processEvents()
+        mw.QMessageBox = real_box
+
+        print("  INFO  阶段 ④ 撤销删除", flush=True)
         # ---------- ④ 撤销删除：两个场景，各自有分辨力 ----------
         #
         # 「清空 id」这一步真正起作用的地方是**删除之后用户又把这个词查了回来**
@@ -2252,6 +2567,7 @@ def main() -> int:
             after is not None and after.notes == "删除之后新写的备注"
         )
 
+        print("  INFO  阶段 ⑤ 测试连接", flush=True)
         # ---------- ⑤ 测试连接 ----------
         # 不通的那条：结论必须是中文，而不是 httpx 的原始异常串。
         probe_note = ""
@@ -2321,6 +2637,7 @@ def main() -> int:
         finally:
             offline_dlg.deleteLater()
 
+        print("  INFO  阶段 ⑥ 多文件拖入", flush=True)
         # ---------- ⑥ 一次拖入多个文件：一个都不丢 ----------
         # 用一组**没在别处出现过**的词：第 ③ 步那三个词此刻已经在库里了，
         # 再导一次会被记成「已存在」，「新增 3 条」就变成了「新增 0 条」。

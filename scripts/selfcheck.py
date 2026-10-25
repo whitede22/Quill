@@ -1458,6 +1458,87 @@ def main() -> int:
     service.refresh("plain")
     check("无备注词条保持空白", repo.get("plain").notes == "", repr(repo.get("plain").notes))
 
+    # ---- 16b. 批量重查：接口没答上来的一条必须保持原样 ----
+    # 「一键重查」是**覆盖写**，一次跑几十上百条。单条重查时用户看得见状态栏那句
+    # 「接口请求失败，已回落到离线词库」，他当场就能判断；批量跑的时候没人盯得住
+    # 每一条，所以这个判定必须由程序做（`accept_fallback=False`）。
+    #
+    # 判据只能是 `fallback_reason`：兜底词条的 `source` 与「用户主动选离线模式」
+    # 完全同值，看 source 分不出来。
+    from app.providers.fallback import FallbackProvider  # noqa: PLC0415
+    from app.providers.base import ProviderError  # noqa: PLC0415
+
+    class _FailingPrimary:
+        name = "openai-compat"
+
+        def lookup(self, word: str) -> Entry:
+            raise ProviderError("请求超时（30 秒）")
+
+    class _OfflineFallback:
+        name = "offline"
+
+        def lookup(self, word: str) -> Entry:
+            return Entry(
+                lemma=word,
+                definition_en="offline body",
+                definition_zh="兜底释义",
+            )
+
+    repo.upsert(
+        Entry(
+            lemma="keepme",
+            definition_en="precious",
+            definition_zh="要保留的内容",
+            notes="我的备注",
+            tags="考研",
+        )
+    )
+    service.set_provider(FallbackProvider(_FailingPrimary(), _OfflineFallback()))
+    refused: Exception | None = None
+    try:
+        service.refresh("keepme", accept_fallback=False)
+    except ProviderError as exc:
+        refused = exc
+    kept_entry = repo.get("keepme")
+    assert kept_entry is not None
+    check("拒绝兜底内容时抛错", refused is not None, str(refused))
+    check(
+        "拒绝兜底后内容保持原样",
+        kept_entry.definition_en == "precious",
+        repr(kept_entry.definition_en),
+    )
+    check("拒绝兜底后备注仍在", kept_entry.notes == "我的备注", repr(kept_entry.notes))
+
+    # 对照组：同一个 provider 不传这个参数时确实会被覆盖。
+    # 没有这一组，上面三条可能只是因为「什么也没发生」而通过——那正是最容易被
+    # 误读成「保护生效」的形态。
+    service.refresh("keepme")
+    check(
+        "接受兜底时确实被覆盖（对照）",
+        repo.get("keepme").definition_en == "offline body",
+        repr(repo.get("keepme").definition_en),
+    )
+    service.set_provider(stub)
+
+    # ---- 16c. persist=False 只取回、不落库 ----
+    repo.upsert(Entry(lemma="nowrite", definition_zh="库里的原值"))
+    fetched, _cached = service.lookup("nowrite", use_cache=False, persist=False)
+    check(
+        "persist=False 能取回新内容",
+        fetched.definition_en == stub.definition_en,
+        repr(fetched.definition_en),
+    )
+    check(
+        "persist=False 没有写库",
+        repo.get("nowrite").definition_zh == "库里的原值",
+        repr(repo.get("nowrite").definition_zh),
+    )
+    check(
+        "persist=False 未建立别名",
+        repo.aliases_of(repo.get("nowrite").id) == [],
+        str(repo.aliases_of(repo.get("nowrite").id)),
+    )
+
     # ---- 17. 导出的保真与完整 ----
     # Markdown 导出会把内容原样交给渲染器，用户备注里的行首结构字符因此会被
     # 「重新解释」：`-` 变列表项、`>` 变引用、`#` 变标题、`1.` 被渲染器重新
@@ -3923,12 +4004,12 @@ def main() -> int:
     )
     # 规则数是**从档位表推出来的**，不是写死的 3。写死的话，往后加一档就会
     # 莫名其妙地红在这里，而真正该被拦住的是「档位改了、规则没跟着改」。
-    # 每个档位 8 条：面板 / 列表 / 状态栏 / 裸按钮 / 计数标签 / 待复习入口 /
-    # 视图切换（选中） / 视图切换（未选中）。
+    # 每个档位 9 条：面板 / 列表 / 状态栏 / 裸按钮 / 计数标签 / 待复习入口 /
+    # 重查入口 / 视图切换（选中） / 视图切换（未选中）。
     # （这个数字会红，正是它存在的意义：新增一处「直接压在原图上」的控件时，
     # 忘记登记的地方会被它抓出来——最透那一档下那处文字会读不出来。）
     _levels = theme_mod.BG_VEIL_LEVELS
-    _per_level = 8
+    _per_level = 9
     check(
         "有背景时主要的面半透明，且每个档位各有一条规则（图片才透得上来）",
         len(_bg_surfaces) == _per_level * len(_levels)
@@ -3950,6 +4031,7 @@ def main() -> int:
         "QPushButton#bare",
         "QLabel#countLabel",
         "QPushButton#review",
+        "QPushButton#refresh",
         "QPushButton#mode",
     )
     _veil_missing = [
@@ -3958,7 +4040,7 @@ def main() -> int:
         if not any(f"{sel} {{" in rule for rule in _bg_surfaces)
     ]
     check(
-        "七个「直接压在原图上」的控件都拿到了受控的表面（少一个就有一处看不清）",
+        "八个「直接压在原图上」的控件都拿到了受控的表面（少一个就有一处看不清）",
         not _veil_missing,
         str(_veil_missing),
     )

@@ -65,8 +65,26 @@ class DictionaryService:
 
     # ---------- 对外接口 ----------
 
-    def lookup(self, word: str, use_cache: bool = True) -> tuple[Entry, bool]:
-        """返回 (词条, 是否来自缓存)。查词结果会写入本地库。"""
+    def lookup(
+        self,
+        word: str,
+        use_cache: bool = True,
+        *,
+        persist: bool = True,
+        accept_fallback: bool = True,
+    ) -> tuple[Entry, bool]:
+        """返回 (词条, 是否来自缓存)。查词结果默认写入本地库。
+
+        两个关键字参数只为「批量重查」而存在，单条查词一律用默认值：
+
+        - `accept_fallback=False`：**不采纳**接口失败后由离线词库兜底产出的内容，
+          改为抛 `ProviderError`（原因就是接口那次的失败原因）。单条重查时用户
+          看得见状态栏那句「接口请求失败，已回落到离线词库」，他当场就能判断；
+          而批量跑几十上百条时没人盯得住每一条，一次网络抖动就会把已经拿到的
+          接口内容换成离线内容——而且是覆盖写，不可撤销。
+        - `persist=False`：只取回、不写库、也不建别名。批量重查要先判定这一条
+          结果可用，再由调用方决定写不写。
+        """
         surface = normalize(word)
         if not surface:
             raise ValueError("请输入要查询的单词")
@@ -87,6 +105,14 @@ class DictionaryService:
         entry.prompt_version = PROMPT_VERSION
         entry.prompt_stale = False
 
+        # 兜底结果的判定必须在这里、在写库之前。`fallback_reason` 是唯一判据
+        # （不能看 source：用户主动选离线模式时 source 同样是 "offline"），
+        # 与详情区那句提示、状态栏那句来源说明用的是同一个字段。
+        if not accept_fallback:
+            reason = str(getattr(entry, "fallback_reason", "") or "").strip()
+            if reason:
+                raise ProviderError(f"接口这次没有返回内容：{reason}")
+
         # 空壳拒收。既没有英文也没有中文释义的返回，实际上等于请求失败——
         # 存进去只会在生词本里留下一条空白记录，并被一并导出、打印。
         # 缺其中一部分则不拒收（拿到多少算多少），但界面会提示缺了什么。
@@ -96,13 +122,22 @@ class DictionaryService:
                 "可能是本次返回不完整，或该词不在模型的知识范围内，请重试。"
             )
 
+        if not persist:
+            return entry, False
+
         saved = self.repo.upsert(entry)
         self._link_variant(surface, saved)
         return self._attach_aliases(saved), False
 
-    def refresh(self, word: str) -> Entry:
-        """忽略缓存强制重新查询（用于结果不理想时重试）。"""
-        return self.lookup(word, use_cache=False)[0]
+    def refresh(self, word: str, *, accept_fallback: bool = True) -> Entry:
+        """忽略缓存强制重新查询（用于结果不理想时重试）。
+
+        `accept_fallback=False` 供批量重查使用：接口这次没答上来的词条保持原样，
+        而不是被兜底内容顶掉。
+        """
+        return self.lookup(
+            word, use_cache=False, accept_fallback=accept_fallback
+        )[0]
 
     def cached(self, word: str) -> Entry | None:
         """只在本地缓存里找，**绝不发网络请求**。

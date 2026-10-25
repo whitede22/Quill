@@ -469,6 +469,19 @@ QPushButton#review {
 QPushButton#review:hover { color: $accent_hover; }
 QPushButton#review:pressed { color: $accent_hover; }
 
+/* 左栏「重查全部」，与「待复习」同行、居右。同样是入口而非主操作：无边框。
+   刻意**不用强调色**——那一行只该有一个强调色落点，两处都用等于两处都不显眼；
+   它用次要文字色，悬停才升一档。配背景图时的垫底见 `_veil_rules`。 */
+QPushButton#refresh {
+    background: transparent;
+    border: none;
+    color: $text2;
+    padding: 4px 8px;
+    text-align: right;
+}
+QPushButton#refresh:hover { color: $accent_hover; }
+QPushButton#refresh:pressed { color: $accent_hover; }
+
 /* 卡片删除 ×。常驻色是**独立常量**，不复用 text3——那个常量还管着占位文字与
    两处禁用态，改它会把那几处可读性一起拖下去。 */
 QPushButton#cardDelete {
@@ -680,6 +693,7 @@ def _veil_rules(pal: dict[str, object]) -> str:
         # 顺序有讲究：`("QPushButton#mode", ...)` 必须**留在最后一条**，
         # 变异脚本有一条锚点就是拿「它 + 收尾括号」定位的。
         ("QPushButton#review", _rgb(pal["surface"])),
+        ("QPushButton#refresh", _rgb(pal["surface"])),
         ("QPushButton#mode:checked", _rgb(pal["accent_soft"])),
         ("QPushButton#mode", _rgb(pal["surface"])),
     )
