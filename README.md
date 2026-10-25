@@ -4,7 +4,7 @@
 
 生词都在自己电脑上的一个 `.db` 文件里，拷走就带走。换台机器不会什么都不剩。
 
-**v1.0.0**（2026-10-25）：修复导入完成后进度条无法关闭，新增一键重查。[下载免安装版](https://github.com/whitede22/Quill/releases/latest)
+**v1.0.0**（2026-10-25）：修复导入完成后进度条无法关闭，新增一键重查。[下载免安装版](https://github.com/whitede22/Quill/releases/latest/download/Quill-v1.0.0-win64.zip) · [更新记录](https://github.com/whitede22/Quill/blob/main/CHANGELOG.md)
 
 ## 界面预览
 
