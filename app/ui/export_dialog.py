@@ -36,6 +36,7 @@ from ..core.exporter import (
     export_json,
     export_markdown,
     export_text,
+    export_wordlist,
 )
 from ..core.models import Collocation, Entry, Synonym
 
@@ -43,6 +44,12 @@ from ..core.models import Collocation, Entry, Synonym
 # 顺序即界面顺序，**第一条是默认项**（最通用的纯文本）。
 EXPORT_FORMATS: tuple[tuple[str, str, str, str], ...] = (
     ("text", "纯文本 (.txt)", "打印用。保留备注里的换行与行首符号，不转义。", ".txt"),
+    (
+        "wordlist",
+        "单词表 (.txt)",
+        "只有单词与中文释义两列，一行一条。软件更新或换机器后可以整份导回来。",
+        ".txt",
+    ),
     ("markdown", "Markdown (.md)", "粘进笔记软件或继续转排版。会转义备注里的符号。", ".md"),
     ("pdf", "PDF (.pdf)", "直接交出去或打印。中文嵌入字体，可搜索可复制。", ".pdf"),
     ("csv", "表格 (.csv)", "用 Excel/WPS 打开筛选排序。同义语与固定搭配各压在一格里，有损。", ".csv"),
@@ -92,6 +99,8 @@ def format_samples() -> dict[str, str]:
     for key, _label, _hint, _ext in EXPORT_FORMATS:
         if key == "text":
             samples[key] = export_text(_SAMPLE_ENTRIES, "英语生词本")
+        elif key == "wordlist":
+            samples[key] = export_wordlist(_SAMPLE_ENTRIES, "英语生词本")
         elif key == "markdown":
             samples[key] = export_markdown(_SAMPLE_ENTRIES, "英语生词本")
         elif key == "csv":
@@ -239,6 +248,12 @@ class FormatHelpDialog(QDialog):
             # 免得有人以为是 bug。
             if key == "csv":
                 box.setToolTip("注意：文件开头有一个不可见的 BOM，用来让 Excel 正确识别编码。")
+            elif key == "wordlist":
+                box.setToolTip(
+                    "两列之间是一个制表符，在这里显示为一段空白。"
+                    "这份文件没有任何标题或表尾——多一行非词条的内容，"
+                    "重新导入时就会多一条「没认出单词」。"
+                )
             elif key == "anki":
                 box.setToolTip(
                     "制表符在样例里显示为一段空白——每一行都是「正面 → 背面 → 标签」三列。"

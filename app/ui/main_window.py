@@ -46,6 +46,7 @@ from ..core.exporter import (
     export_markdown,
     export_pdf,
     export_text,
+    export_wordlist,
 )
 from ..core.importer import (
     ImportOutcome,
@@ -478,7 +479,8 @@ class MainWindow(QMainWindow):
 
         self.btn_export = QPushButton("导出")
         self.btn_export.setToolTip(
-            "导出为纯文本 / Markdown / PDF / 表格 / Anki / JSON（点一下会先让你选）"
+            "导出为纯文本 / 单词表 / Markdown / PDF / 表格 / Anki / JSON"
+            "（点一下会先让你选）"
         )
         self.btn_format_help = QPushButton("格式说明")
         self.btn_format_help.setToolTip("每种导出格式长什么样、适合用来做什么")
@@ -2307,9 +2309,15 @@ class MainWindow(QMainWindow):
             (k, lab, h, e) for k, lab, h, e in EXPORT_FORMATS if k == dialog.format_key
         )
 
-        suggested = str(Path.home() / f"{default_title}_{datetime.now():%Y%m%d}{ext}")
+        # 单词表与纯文本同为 .txt。默认文件名必须区分开，否则同一目录下第二次
+        # 导出会弹出「已存在，是否覆盖」，而用户以为自己导的是另一种格式。
+        name_suffix = "_单词表" if key == "wordlist" else ""
+        suggested = str(
+            Path.home() / f"{default_title}{name_suffix}_{datetime.now():%Y%m%d}{ext}"
+        )
         filters = {
             "text": "纯文本 (*.txt)",
+            "wordlist": "单词表 (*.txt)",
             "markdown": "Markdown (*.md)",
             "pdf": "PDF (*.pdf)",
             "csv": "表格 (*.csv)",
@@ -2344,6 +2352,15 @@ class MainWindow(QMainWindow):
                 "\n\n开头几行 `#` 是给 Anki 认的指令（分隔符、富文本、标签列），"
                 "它导入时会自己读掉；用别的方式打开时删掉那几行即可。"
             )
+        elif key == "wordlist":
+            # 这里必须把「它不是备份」说清楚：两种 .txt 摆在同一个对话框里，
+            # 用户很容易拿单词表当备份，等换机器时才发现例句与搭配都没了。
+            extra = (
+                "\n\n只有单词与中文释义两列，没有标题也没有表尾，"
+                "整份文件可以再导回来。\n"
+                "它不是备份：音标、例句、搭配、备注都没有带上，"
+                "要完整备份请用 JSON。"
+            )
         if (
             QMessageBox.question(
                 self,
@@ -2368,6 +2385,7 @@ class MainWindow(QMainWindow):
             return
         writers = {
             "text": export_text,
+            "wordlist": export_wordlist,
             "markdown": export_markdown,
             "csv": export_csv,
             "anki": export_anki,
