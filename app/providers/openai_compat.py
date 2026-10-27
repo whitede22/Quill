@@ -12,9 +12,14 @@ import time
 
 import httpx
 
-from ..core.models import Entry
+from ..core.models import Entry, Phrase
 from .base import NonRetryableError, ProviderError
-from .prompts import SYSTEM_PROMPT, build_user_prompt
+from .prompts import (
+    PHRASE_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_phrase_prompt,
+    build_user_prompt,
+)
 
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
 
@@ -148,11 +153,23 @@ class OpenAICompatProvider:
         self.max_retries = max(1, int(max_retries))
 
     def _request(self, word: str) -> str:
+        return self._chat(SYSTEM_PROMPT, build_user_prompt(word))
+
+    def _request_phrase(self, phrase: str) -> str:
+        return self._chat(PHRASE_SYSTEM_PROMPT, build_phrase_prompt(phrase))
+
+    def _chat(self, system: str, user: str) -> str:
+        """发一次对话请求并取回正文。
+
+        词条与词组**共用这一处**：请求体、鉴权头、超时与网络异常翻译只有一份
+        定义。各写一份的后果不是代码重复，而是两份会慢慢分叉——某天只给其中
+        一份加了超时或改了错误文案，另一条路径就悄悄用着旧行为。
+        """
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_user_prompt(word)},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
             "temperature": 0.3,
             "stream": False,
@@ -273,6 +290,29 @@ class OpenAICompatProvider:
                 if attempt < self.max_retries - 1:
                     time.sleep(0.6 * (attempt + 1))
         raise ProviderError(str(last_error) if last_error else "查词失败")
+
+    def lookup_phrase(self, phrase: str) -> Phrase:
+        """按词组查一次。
+
+        重试策略与 `lookup` 完全一致（同一套 `max_retries`、同样的
+        NonRetryableError 直通），差别只在提示词与解析。**空壳拒收也在这里**：
+        没有中文简释的返回等于请求失败，写进词组收藏只会多一条只有标题的空卡。
+        """
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                content = self._request_phrase(phrase)
+                result = Phrase.from_payload(extract_json(content), phrase)
+                if not result.gloss_zh:
+                    raise ProviderError("模型没有返回词组的释义")
+                return result
+            except NonRetryableError:
+                raise
+            except (httpx.HTTPError, ProviderError) as exc:
+                last_error = exc
+                if attempt < self.max_retries - 1:
+                    time.sleep(0.6 * (attempt + 1))
+        raise ProviderError(str(last_error) if last_error else "词组查询失败")
 
 
 def provider_status(config: dict, api_key: str) -> str:

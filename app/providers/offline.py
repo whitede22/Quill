@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 from urllib.parse import quote
 
-from ..core.models import Entry
+from ..core.models import Entry, Phrase
 from .base import ProviderError
 
 # 离线词库的 schema 版本。**由读取方定义、构建脚本导入**：两边各写一份常量
@@ -220,6 +220,23 @@ class OfflineDictProvider:
                 "或用 scripts/build_offline_dict.py 构建完整词库。"
             )
         return self._to_entry(row, lemma or surface)
+
+    def lookup_phrase(self, phrase: str) -> Phrase:
+        """离线词库结构上不含词组，只能如实拒绝。
+
+        **这不是「这次没查着」，而是这个来源里没有这类数据**：构建脚本
+        （`scripts/build_offline_dict.py` 的 PLAIN_WORD_COND）只保留
+        `[a-z-]` 组成的单条词，含空格的条目在生成阶段就被排除了——实测内置
+        词库 49527 条里含空格的是 0 条。所以这里不假装查一遍再说「未收录」，
+        直接把原因和出路说清楚。
+
+        报错文案要指向能解决的动作（去接接口），而不是「未收录」——后者会让
+        用户以为是自己那条词组太生僻。
+        """
+        raise ProviderError(
+            "本机离线词库只收单词，不含词组。\n"
+            "词组请到右上角「设置」接上接口后再查。"
+        )
 
     def close(self) -> None:
         if self._conn is not None:

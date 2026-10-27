@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import atexit
+import faulthandler
 import gc
 import os
 import re
@@ -20,6 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _GUI_HOME = tempfile.mkdtemp(prefix="quill_gui_")
 os.environ["QUILL_HOME"] = _GUI_HOME
+
+# 整轮兜底超时的上限。正常一轮在一分钟以内（最后一个阶段排在 26s，它自己再跑
+# 十几秒），这里给三倍余量。超时不是「慢」，是「卡住」——见 main() 里的 _watchdog。
+WATCHDOG_MS = 180_000
 
 
 def _clean_home() -> None:
@@ -658,6 +663,40 @@ EXPECT: dict = {
     "接口模式但实际用离线词库时重查被拒绝": True,
     "词组模式下重查被拒绝": True,
     "词组模式下重查按钮隐藏": True,
+    # ---- 词组查询（本轮新增） ----
+    # 「进词组收藏」与「不写生词本」必须成对：只验前者，一个把词组同时写进
+    # 两张表的实现照样通过；只验后者，一个什么都不写的实现也过。
+    "词组查询进词组收藏": True,
+    "词组查询不写生词本": True,
+    "词组查询后详情区显示该词组": "become ubiquitous",
+    "词组查询后列表选中该条": True,
+    "词组模式下输入框提示改为词组": (
+        lambda v: isinstance(v, str) and "词组" in v and "单词" not in v
+    ),
+    "生词本模式下输入框提示是单词": (
+        lambda v: isinstance(v, str) and "单词" in v and "词组" not in v
+    ),
+    "词组查询状态栏": (
+        lambda v: isinstance(v, str) and "已收藏到词组收藏" in v
+    ),
+    "重复查词组不重复写库": True,
+    "重复查词组的提示指向已有那条": (
+        lambda v: isinstance(v, str) and "已在词组收藏里" in v
+    ),
+    # 单个词误入词组模式：拒绝 + 指路。写进去会在两个集合各留一条。
+    "词组模式下单词被拒绝并指路": (
+        lambda v: isinstance(v, str) and "不是词组" in v and "生词本" in v
+    ),
+    "词组模式下单词没有写进任何集合": True,
+    "词组模式下离线来源被拒绝": True,
+    # 导入：词组进词组收藏，报告要单列条数（混进「新增 N 条」会让用户对账对不上）
+    "导入词组文件进词组收藏": True,
+    "导入词组的报告单列条数": (
+        lambda v: isinstance(v, str) and "新增词组 1 条" in v
+    ),
+    # 这一节种进去的词组必须撤干净：后面的搭配阶段拿「左栏正好列出那两条」
+    # 当判据，上一个阶段留下的数据会让它报成「词组列表不刷新」。
+    "词组查询用过的词组已清掉": True,
     "撤销按钮在删除后出现": True,
     "撤销把词条放回来了（含备注与标签）": True,
     # 反例：代码注释里曾声称「SQLite 会把删掉的行号分给下一个新词条」，
@@ -751,10 +790,13 @@ EXPECT: dict = {
     ),
     "撤销词组后左栏切到词组收藏": "phrases",
     "撤销用过即失效": True,
-    # 查词结果属于生词本。在词组收藏里查词却不切回去的话，用户在生词本里
-    # 翻不到刚查的词，而状态栏照说「已收录」。
-    "在词组模式查词会自动切回生词本": "words",
-    "查词结果落在生词本的列表里": True,
+    # 生词本模式下的查词不能因为「输入框按模式分派」而坏掉。分派写错（比如
+    # 写成 `if self._mode:` 的真值判断）时，生词本里查一个词会走进词组那条路，
+    # 界面照常弹一句「不是词组」，用户以为自己的词有问题。
+    # 这一条原本断言的是「词组模式查词会自动切回生词本」——那个行为已被
+    # ③c 的「词组模式下单词被拒绝并指路」取代（词组模式只查词组，单词当场
+    # 拒绝并指向生词本，不再静默切集合替用户查），这里遂改为守住留下那一半。
+    "生词本模式查词照常落库": True,
     # 欢迎页 / 教程（welcome_check）。
     "欢迎弹窗标题": "欢迎来到 Quill",
     "欢迎弹窗署名": "made by wtd22",
@@ -1459,10 +1501,12 @@ def main() -> int:
         preview = next((t for k, t in seen if k == "question"), "")
         report = next((t for k, t in seen if k == "information"), "")
 
-        # 识别出 5 个词，其中 z 开头那个查不到（PickyProvider 不认），
-        # 所以最终落库 4 个——「认出多少」与「收进多少」是两件事，报告要分开说
+        # 识别出 5 条，其中 z 开头那个查不到（PickyProvider 不认），
+        # 所以最终落库 4 个——「认出多少」与「收进多少」是两件事，报告要分开说。
+        # 文案里现在把「单词 / 词组」分开计数（词组另进一个集合），这条断言
+        # 认的是**总数与跳过行**，不跟着措辞漂。
         results["导入前先报识别结果"] = (
-            "认出 5 个单词" in preview and "跳过 1 行" in preview
+            "认出 5 条" in preview and "跳过 1 行" in preview
         )
         results["导入确认框列出识别到的词"] = "alphaone" in preview and "delta" in preview
         results["导入新增落库数"] = repo.count() - before
@@ -2476,6 +2520,166 @@ def main() -> int:
         app.processEvents()
         mw.QMessageBox = real_box
 
+        print("  INFO  阶段 ③c 词组查询", flush=True)
+        # ---------- ③c 词组查询：查词组、重复查、单词误入、离线拒绝、导入词组 ----------
+        #
+        # 词组的整条链路是新的：输入框 → provider.lookup_phrase → phrases 表 →
+        # 词组详情。四段里任何一段接错，界面都不会报错——结果是「查不到」，
+        # 而用户会把责任算到自己那条词太生僻上。所以每段都读真库、看真控件。
+        #
+        # 用 MockProvider 的示例搭配当数据（`become ubiquitous` 等），
+        # 不另造一套只在测试里存在的词典。
+        window.service.set_provider(MockProvider())
+
+        class _PhraseBox:
+            StandardButton = real_box.StandardButton
+
+            @staticmethod
+            def information(*a, **k):
+                notices.append(a[2] if len(a) > 2 else "")
+
+            warning = staticmethod(information)
+
+            @staticmethod
+            def question(*a, **k):
+                return real_box.StandardButton.Yes
+
+        def _detail_title() -> str | None:
+            for label in window.detail.findChildren(QLabel):
+                if label.objectName() == "lemma":
+                    return label.text()
+            return None
+
+        mw.QMessageBox = _PhraseBox
+        notices.clear()
+        # 先把搜索框的防抖定时器停掉。上一步 `filter.clear()` 会起一个 280ms 的
+        # `_reload_list()`（不带 select_id），它会在下面几次 pump 里把列表整份
+        # 重建一遍、把刚选中的那行清掉——断言于是读到「没选中」，而实际上选中
+        # 与清除都是真的发生过的。这条竞态不影响功能，只让判据失去分辨力。
+        window._filter_timer.stop()
+        window.filter.clear()
+        window._switch_mode(mw.MODE_PHRASES)
+        app.processEvents()
+        # 同一个输入框在两个模式下查的是两种东西，提示文字必须跟着变：
+        # 词组模式里还写着「输入英语单词」，用户输入 take off 被拆开时会
+        # 以为是程序把词组拆错了，而不是自己站错了集合。
+        results["词组模式下输入框提示改为词组"] = window.input.placeholderText()
+
+        # 每个场景都用**等到条件成立**而不是固定睡够：这一整段插在定时器
+        # 编排里（别的检查按绝对时间排在被后面），多睡几秒就会把后面的
+        # `collocation_check` / `surface_check` 挤到 `app.quit()` 之后，
+        # 那些场景随即变成「未采集到该观测」——看起来像它们坏了。
+        def _wait_until(pred, ms: int = 3000) -> bool:
+            deadline = time.monotonic() + ms / 1000
+            while time.monotonic() < deadline:
+                app.processEvents()
+                if pred():
+                    return True
+                time.sleep(0.005)
+            return False
+
+        words_before = repo.count()
+        phrases_before = repo.count_phrases()
+        # 这一节写进去的词组，收尾时全部撤掉（见本节末尾）。记下进这一节时的家底，
+        # 收尾核对就比这个数——不写死成 0，否则别的阶段哪天先种一条，失败会报成
+        # 「词组查询留下的没清掉」，指向错误的方向。
+        phrases_at_entry = phrases_before
+        window.input.setText("become ubiquitous")
+        window._do_lookup()
+        # **等待条件只能读界面，不能读库。** 查询在 worker 线程里跑，而仓储与
+        # 主线程共用同一个 sqlite 连接——主线程在 worker 还在写的时候读一次，
+        # 直接 `InterfaceError: bad parameter or other API misuse`（实测踩过）。
+        # 详情区渲染出来时，worker 早已写完并回到主线程。
+        _wait_until(lambda: _detail_title() == "become ubiquitous", 4000)
+        stored_phrase = repo.get_phrase("become ubiquitous")
+        results["词组查询进词组收藏"] = bool(
+            stored_phrase is not None and repo.count_phrases() == phrases_before + 1
+        )
+        # **生词本一条都不许多**：词组模式下输入 `become ubiquitous`，若被拆成
+        # become / ubiquitous 两条生词，界面照样显示「批量查词完成 · 新增 2 条」，
+        # 用户看不出这跟他要的那条词组毫无关系。
+        results["词组查询不写生词本"] = repo.count() == words_before
+        results["词组查询后详情区显示该词组"] = _detail_title()
+        results["词组查询后列表选中该条"] = bool(
+            window.list.currentItem() is not None
+            and stored_phrase is not None
+            and window.list.currentItem().data(mw._USER_ROLE) == stored_phrase.id
+        )
+        results["词组查询状态栏"] = window.statusBar().currentMessage()
+
+        # 重复查：命中库里那条，不再请求接口。判据落在「条数没涨」上，
+        # 与详情区那个「收藏」按钮同一个判据。
+        window.input.setText("  Become   Ubiquitous ")
+        window._do_lookup()
+        _wait_until(lambda: "已在词组收藏里" in window.statusBar().currentMessage(), 1500)
+        results["重复查词组不重复写库"] = repo.count_phrases() == phrases_before + 1
+        results["重复查词组的提示指向已有那条"] = window.statusBar().currentMessage()
+
+        # 单个词误入词组模式：拒绝，并指向生词本。写进去的话，同一个词会在
+        # 两个集合里各有一条，删了一边另一边还在，而两边都自称「释义」。
+        notices.clear()
+        words_before = repo.count()
+        phrases_before = repo.count_phrases()
+        window.input.setText("ubiquitous")
+        window._do_lookup()
+        _wait_until(lambda: bool(notices), 1500)
+        results["词组模式下单词被拒绝并指路"] = notices[-1] if notices else ""
+        results["词组模式下单词没有写进任何集合"] = (
+            repo.count() == words_before and repo.count_phrases() == phrases_before
+        )
+
+        # 离线来源：结构上不含词组，必须当场拒绝并说明出路，而不是逐条报
+        # 「离线词库未收录」——后者会把配置问题伪装成词库容量问题。
+        window.service.set_provider(OfflineStubProvider())
+        notices.clear()
+        window.input.setText("look after")
+        window._do_lookup()
+        _wait_until(lambda: bool(notices), 1500)
+        results["词组模式下离线来源被拒绝"] = bool(
+            notices and "离线词库" in notices[-1] and repo.get_phrase("look after") is None
+        )
+        window.service.set_provider(MockProvider())
+
+        # 导入词组：2–4 个纯英文词的行按词组收，进词组收藏；5 词以上仍跳过。
+        phrase_doc = home / "phrase_list.txt"
+        phrase_doc.write_text(
+            "be ubiquitous in\nlook after this cat now\n", encoding="utf-8"
+        )
+        phrases_before = repo.count_phrases()
+        window._import_path(phrase_doc)
+        _wait_until(
+            lambda: window._import_progress is None
+            and "新增词组" in window.statusBar().currentMessage(),
+            6000,
+        )
+        results["导入词组文件进词组收藏"] = bool(
+            repo.get_phrase("be ubiquitous in") is not None
+            and repo.count_phrases() == phrases_before + 1
+        )
+        results["导入词组的报告单列条数"] = window.statusBar().currentMessage()
+
+        # 收尾：把这一节种进去的词组撤掉。**谁种的数据谁收拾。**
+        # 后面的 collocation_check 拿「左栏正好列出已收藏的那两条」当判据，
+        # 库里的家底一变它就报「词组列表漏了」——而真正的原因是上一阶段留下的
+        # 数据。实测踩过：本节的 `become ubiquitous` / `be ubiquitous in` 留在
+        # 库里，那边三条断言全红，症状指向「词组模式不刷新列表」，方向完全错。
+        # 清完当场核对，别让「没清掉」这件事等到两百行之后才以别的名义爆出来。
+        for seeded in ("become ubiquitous", "be ubiquitous in"):
+            row = repo.get_phrase(seeded)
+            if row is not None and row.id is not None:
+                repo.delete_phrase(int(row.id))
+        results["词组查询用过的词组已清掉"] = bool(
+            repo.get_phrase("become ubiquitous") is None
+            and repo.get_phrase("be ubiquitous in") is None
+            and repo.count_phrases() == phrases_at_entry
+        )
+
+        window._switch_mode(mw.MODE_WORDS)
+        app.processEvents()
+        window.service.set_provider(PickyProvider())
+        mw.QMessageBox = real_box
+        results["生词本模式下输入框提示是单词"] = window.input.placeholderText()
+
         print("  INFO  阶段 ④ 撤销删除", flush=True)
         # ---------- ④ 撤销删除：两个场景，各自有分辨力 ----------
         #
@@ -3045,23 +3249,33 @@ def main() -> int:
             window.btn_undo.isHidden() and window._last_deleted is None
         )
 
-        # ---------- ⑦ 在词组模式查词：自动切回生词本 ----------
-        # 查词的结果属于生词本。不切回去的话，用户在词组收藏里搜一个词、什么都没
-        # 出现（或出现一个不相干的列表），而状态栏照说「已收录」。
-        window._switch_mode(mw.MODE_PHRASES)
-        window.input.setText("ubiquitous")
+        # ---------- ⑦ 生词本模式查词照常 ----------
+        # 这一段原先验的是「在词组模式查词会自动切回生词本」。那个行为已经不
+        # 存在了，而且是**刻意**改掉的：词组模式只查词组，输入单个词当场拒绝
+        # 并指向生词本（③c 里用同一个词、读数更细地测过：提示文案 + 两个集合
+        # 的条数都没动）。替用户静默换集合查词会让「take off 是词组、apple 是
+        # 单词」两种语义在同一个输入框里随机切换，用户无从预期。
+        #
+        # 留下的一半仍然值得守：`_do_lookup()` 现在按模式分派，分派写错（例如
+        # 写成 `if self._mode:` 的真值判断）时，**生词本**里查词会走进词组那条
+        # 路，用户看到一句「不是词组」，而自己的词再也没有被收进来——症状指向
+        # 完全错误的方向。
+        #
+        # 词是**这一轮才第一次出现**的（`meticulous` 在别处没有任何引用），
+        # 否则「库里有这条」恒为真：`ubiquitous` 在 main() 开头就被查过一次，
+        # 拿它当判据的断言永远绿。
+        assert repo.get("meticulous") is None, "meticulous 不该在本轮此前出现过"
+        window._switch_mode(mw.MODE_WORDS)
+        window.input.setText("meticulous")
         window._do_lookup()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             app.processEvents()
             time.sleep(0.01)
             shown = window.detail._entry
-            if shown is not None and shown.lemma == "ubiquitous":
+            if shown is not None and shown.lemma == "meticulous":
                 break
-        results["在词组模式查词会自动切回生词本"] = window._mode
-        results["查词结果落在生词本的列表里"] = bool(
-            window.list.count() > 0 and window._mode == mw.MODE_WORDS
-        )
+        results["生词本模式查词照常落库"] = repo.get("meticulous") is not None
 
         # 收尾：回到生词本，清掉搜索框，免得影响后面的导入阶段。
         window.filter.clear()
@@ -3071,7 +3285,7 @@ def main() -> int:
             f"  INFO  搭配：渲染={results['右侧固定搭配区列出每条搭配']} "
             f"收藏={results['点收藏把搭配写进词组收藏']} "
             f"撤销={results['撤销把词组连简释与例句一起放回来']} "
-            f"查词切回={results['在词组模式查词会自动切回生词本']}",
+            f"查词回到生词本={results['生词本模式查词照常落库']}",
             flush=True,
         )
 
@@ -3112,6 +3326,29 @@ def main() -> int:
     # 先立下「没异常」的默认值：这条判定项若压根没被观测到，判定循环会按
     # 「有判定标准却没有观测到」判失败，届时失败得莫名其妙。
     results["测试内部异常"] = "(无异常)"
+
+    # 整轮兜底超时。**没有它，「卡住」只表现为「慢」**：某个阶段弹出的模态框在
+    # offscreen 下没人能点，nested event loop 就停在那儿，后面的阶段一个都不触发，
+    # 日志停在半句上（实测卡过 9 分钟、也卡过 2h34m）。看日志的人分不清是环境
+    # 抽风还是自己改错了——而这正是不该让测试自己承担的判断。
+    # 顺带把栈打出来：卡住的调用栈比「耗时 4 分钟」有用得多。
+    def _watchdog() -> None:
+        stuck = QApplication.activeModalWidget()
+        if stuck is not None:
+            # nested exec() 不响应 app.quit()，得让模态框自己退出去，外层循环
+            # 才回得来。这里只是兜底，真正的修法永远是「别让它弹出来」。
+            stuck.reject()
+        results["测试内部异常"] = (
+            f"整轮超时（{WATCHDOG_MS // 1000}s）：有阶段卡住了"
+            + ("（当时有模态框）" if stuck is not None else "")
+        )
+        print("  INFO  看门狗触发，打印当前调用栈：", flush=True)
+        faulthandler.dump_traceback()
+        app.quit()
+        # 模态框刚被 reject、外层循环可能还没回到，再补一次退出。
+        QTimer.singleShot(200, app.quit)
+
+    QTimer.singleShot(WATCHDOG_MS, _watchdog)
     QTimer.singleShot(300, _guard(do_lookup))
     QTimer.singleShot(1300, _guard(verify))
     QTimer.singleShot(2600, _guard(finalize))

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from ..core.models import Collocation, Entry, Synonym
+from ..core.models import Collocation, Entry, Phrase, Synonym
 from .base import ProviderError
 
 _SAMPLES: dict[str, dict] = {
@@ -142,4 +142,26 @@ class MockProvider:
                 Collocation(phrase=p, gloss_zh=g, example=e, example_zh=z)
                 for p, g, e, z in data["collocations"]
             ],
+        )
+
+    def lookup_phrase(self, phrase: str) -> Phrase:
+        """示例模式也能演示词组查询。
+
+        数据直接取自各示例词条的固定搭配：那本来就是真实词组，凭空再造一批
+        只会多一份要维护的假数据。找不到时**如实说找不到并给出出路**——返回
+        一条只有标题的空词组会让演示模式看起来「能用」，而收藏进去是空的。
+        """
+        key = " ".join((phrase or "").split()).lower()
+        for data in _SAMPLES.values():
+            for text, gloss, example, example_zh in data["collocations"]:
+                if text.strip().lower() == key:
+                    return Phrase(
+                        phrase=text,
+                        gloss_zh=gloss,
+                        example=example,
+                        example_zh=example_zh,
+                    )
+        raise ProviderError(
+            f"离线示例模式只有 {sum(len(d['collocations']) for d in _SAMPLES.values())}"
+            f" 条词组，「{phrase}」不在其中。请在设置中配置 API 后重试。"
         )

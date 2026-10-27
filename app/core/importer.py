@@ -71,9 +71,30 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 # 一段里最多允许几个词。**这个上限不能取 1**：词表里夹几条短语
 # （`live to tell` / `generally speaking`）是常态，而旧判据要求「每段都是
 # 单个词」，于是夹一条短语就让**整条分支不成立**，一行 57 段的词表被判成
-# 「一行有 62 个词，像是句子不是词条」收了 0 个词。放宽到 3 之后，
-# 自然语言的分句（`He went home, she stayed…`）仍然远在这条线之上。
-MAX_WORDS_PER_SEGMENT = 3
+# 「一行有 62 个词，像是句子不是词条」收了 0 个词。放宽之后，自然语言的分句
+# （`He went home, she stayed…`）仍然远在这条线之上。
+#
+# 现在这个上限**不再单独定义**，直接用 `MAX_WORDS_PER_PHRASE`：一段超过 4 个词
+# 既不是词组，也不该让整行作废，判定交给句子阈值。两处各写一个数字时，改了
+# 一处忘了另一处，行为会变成「4 词的词组认得出来，但含它的那一行整行作废」。
+#
+# ---------- 词组 ----------
+#
+# 至少两个词（单个词是生词，不是词组），最多 4 个。
+#
+# 上限取 4 是**取舍**，不是事实：`as a matter of fact` 这类 5 词习语收不进来。
+# 取更大的代价是误收——不带标点的自然语句（`she went to the store`）字符集与
+# 词组**完全一样**，词数越多越难分辨。4 词以内的纯英文串几乎都是搭配，5 词以上
+# 更像句子；越界的那几行会**如实报出来**（「这一行有 5 个词，像是句子」），
+# 用户看到就知道该改什么，而不是自己那条短语凭空消失。
+MIN_WORDS_PER_PHRASE = 2
+MAX_WORDS_PER_PHRASE = 4
+
+# 候选的两条去向。写成常量而不是散落的字面量：`ParsedWord.kind` 与
+# `run_import` 的分派要按同一份定义对齐，字符串写错一个字（`"phrases"`）
+# 不会报错，只会让条词组悄悄走词条那条路。
+KIND_WORD = "word"
+KIND_PHRASE = "phrase"
 
 # ---------- 词法 ----------
 
@@ -186,7 +207,7 @@ _NESTED_FILL_FIELDS = frozenset({"synonyms", "collocations"})
 
 @dataclass
 class ParsedWord:
-    """一个候选词。
+    """一个候选词（或一条候选词组）。
 
     `notes` 与 `fill` 只在解析**带结构的**文件（本程序导出的文本 / Markdown /
     JSON、有道单词本的 XML）时才有内容：
@@ -195,12 +216,18 @@ class ParsedWord:
     - `fill` 是**可回填的字段**（释义、音标、分类等），键名必须在
       `_FILLABLE_FIELDS` 白名单里。用字典而不是给每个可回填字段开一个属性，
       是为了新增字段时不必再动这个类，且写入侧能一次校验完。
+
+    `kind` 决定这条东西**写进哪张表**。生词本与词组收藏是两张各自从 1 发号的
+    表，把 `take off` 当词条写进去会得到一条 lemma 里带空格的怪词条；反之把
+    `apple` 当词组写进去，词组收藏里就多一条与生词本重复的行。所以这个字段
+    不是分类标签，是**路由**，由解析器判定、由 `run_import` 消费，界面不猜。
     """
 
     word: str
     line: int
     notes: str = ""
     fill: dict = field(default_factory=dict)
+    kind: str = KIND_WORD
 
 
 @dataclass
@@ -215,6 +242,16 @@ class ParseResult:
     def count(self) -> int:
         return len(self.words)
 
+    @property
+    def phrase_count(self) -> int:
+        """其中有几条是词组。报告要把两类分开说，否则用户看到「认出 12 个」
+        却只多出 9 条生词，会以为漏收了 3 个。"""
+        return sum(1 for item in self.words if item.kind == KIND_PHRASE)
+
+    @property
+    def word_count(self) -> int:
+        return self.count - self.phrase_count
+
     def preview(self, limit: int = 8) -> str:
         """给用户核对识别结果用的前几个词。"""
         shown = [w.word for w in self.words[:limit]]
@@ -226,22 +263,37 @@ class ParseResult:
 
 @dataclass
 class ImportOutcome:
-    """一次导入的分类结果。三个清单互不重叠，加起来等于处理过的词数。"""
+    """一次导入的分类结果。
+
+    词条与词组**分开统计**：它们进的是两张表，「新增 5 条」在用户眼里是
+    「生词本多了 5 条」，把词组混进同一个数字，他一对账就发现对不上——
+    而实际上一条都没漏。
+    """
 
     added: list[str] = field(default_factory=list)
     existing: list[str] = field(default_factory=list)
     failed: list[tuple[str, str]] = field(default_factory=list)
+    phrases_added: list[str] = field(default_factory=list)
+    phrases_existing: list[str] = field(default_factory=list)
     notes_restored: int = 0
     cancelled: bool = False
 
     @property
     def handled(self) -> int:
-        return len(self.added) + len(self.existing) + len(self.failed)
+        return (
+            len(self.added)
+            + len(self.existing)
+            + len(self.phrases_added)
+            + len(self.phrases_existing)
+            + len(self.failed)
+        )
 
     def merge(self, other: "ImportOutcome") -> None:
         self.added.extend(other.added)
         self.existing.extend(other.existing)
         self.failed.extend(other.failed)
+        self.phrases_added.extend(other.phrases_added)
+        self.phrases_existing.extend(other.phrases_existing)
         self.notes_restored += other.notes_restored
         self.cancelled = self.cancelled or other.cancelled
 
@@ -782,37 +834,43 @@ def _md_notes(body: list[str]) -> str:
 
 
 def parse_word_list(text: str) -> ParseResult:
-    """逐行取词。适用于别处整理来的生词表。
+    """逐行取词，兼收词组。适用于别处整理来的生词表 / 词组表。
 
-    `skipped` 里除了「整行跳过」，也会出现**行内某一段没能收录**的记录
-    （一行逗号列表里夹着 `live to tell` 这种短语）。两者都是「用户需要知道
-    自己少收了什么」，放在同一个清单里正是报告要的粒度。
+    一条行里可能**既有词也有词组**（`happy, take off`），两者各进各的表；
+    也有一行就是一条词组（`in charge of`）——那种行以前被整行拒收，理由写作
+    「含空格，像是词组不是单词」，用户的词组表因此一条都进不来。
+
+    `skipped` 里除了「整行跳过」，也会出现**行内某一段没能收录**的记录。
+    两者都是「用户需要知道自己少收了什么」，放在同一个清单里正是报告要的粒度。
     """
     lines = text.splitlines()
     result = ParseResult(source_format="生词表", total_lines=len(lines))
     seen: dict[str, int] = {}
+    seen_phrases: dict[str, int] = {}
 
     for no, raw in enumerate(lines, start=1):
         line = raw.strip()
         if not line:
             continue
-        words, reason, rejected = _words_in_line(line)
-        if reason:
-            result.skipped.append((no, reason))
+        pick = _words_in_line(line)
+        if pick.reason:
+            result.skipped.append((no, pick.reason))
             continue
-        for note in rejected:
-            # 「这一行收了单词、另有几段不是词条」同样要说出来：用户看到的是
+        for note in pick.rejected:
+            # 「这一行收下了别的、另有几段没收」同样要说出来：用户看到的是
             # 「这行收下了」，而他那条短语其实没进去，事后无从发现。
             result.skipped.append((no, note))
-        if not words:
+        if not pick.words and not pick.phrases:
             # 只把「看起来想说点什么」的行记进跳过清单：分割线与空行不算，
             # 否则报告里全是噪音，真正需要用户注意的那几行会被淹没。
             # `rejected` 已逐条说明原因时不再叠一句笼统的「没认出单词」。
-            if not rejected and not _DECOR_RE.fullmatch(line):
+            if not pick.rejected and not _DECOR_RE.fullmatch(line):
                 result.skipped.append((no, f"没认出单词：{line[:40]}"))
             continue
-        for word in words:
+        for word in pick.words:
             _collect(result, seen, word, no)
+        for phrase in pick.phrases:
+            _collect_phrase(result, seen_phrases, phrase, no)
     return result
 
 
@@ -820,28 +878,49 @@ def _is_plain_segment(seg: str) -> bool:
     """一段是不是「若干英文词」——「用分隔符明确列开的纯词表」的判据。
 
     字符集只允许字母 / 撇号 / 连字符 / 空格（带数字与标点的段说明这一行不是
-    纯词表），词数限定在 `1..MAX_WORDS_PER_SEGMENT`。
+    纯词表），词数限定在 `1..MAX_WORDS_PER_PHRASE`。
 
-    **词数上限取 3 而不是 1，是这条判据唯一需要解释的地方。** 取 1 时，一行里
+    **词数上限不能取 1，这是本条判据唯一需要解释的地方。** 取 1 时，一行里
     只要夹一条短语（`live to tell`），整条分支就不成立，整行随即被
     `MAX_WORDS_PER_LINE` 判成「像是句子不是词条」——一份 57 段的课程词表因此
-    收成 0 个词。放宽之后多出来的那些段由 `_valid_word` 兜底（它本来就只认
-    单个词），所以**不会写错内容**，最坏是少收，而且会如实进报告。
+    收成 0 个词。上限现在与词组上限同一个数（4），因为超过 4 词的那一段
+    既不是词组、也不该让整行作废，判定交给句子阈值。
     """
     if not _PLAIN_SEGMENT_RE.fullmatch(seg):
         return False
-    return 1 <= len(_tokens_in(seg)) <= MAX_WORDS_PER_SEGMENT
+    return 1 <= len(_tokens_in(seg)) <= MAX_WORDS_PER_PHRASE
 
 
-def _words_in_line(line: str) -> tuple[list[str], str, list[str]]:
-    """从一行里取出候选词。
+@dataclass
+class _LinePick:
+    """一行解析出来的东西。
 
-    返回 `(可收录的词, 整行跳过的原因, 本行里没能收录的段的说明)`。
-    前两项互斥：整行跳过的原因为空时才会返回第三项。
+    四个字段的互斥关系由 `_words_in_line` 保证：`reason` 非空表示整行跳过，
+    此时其余三项全空；否则 `words` / `phrases` 至少有一项非空，而 `rejected`
+    只用来交代「这一行另外那几段为什么没收」。
+    """
 
-    第三项是**必须有的**：一行 57 段的词表里夹着 `live to tell` 这类短语时，
-    单词照收、短语不是词条——旧实现把短语静默丢掉，用户看到的是「这一行收下了」，
-    事后无从发现自己那条短语没进去。宁可多一行报告，不写一笔看不见的账。
+    words: list[str] = field(default_factory=list)
+    phrases: list[str] = field(default_factory=list)
+    reason: str = ""
+    rejected: list[str] = field(default_factory=list)
+
+
+def _words_in_line(line: str) -> _LinePick:
+    """从一行里取出候选词与候选词组。
+
+    三条分支，按「用户写得有多明确」排：
+
+    1. **用分隔符列开**（`happy, take off`）：段数不限，全取。一段一个词就是
+       生词，两个词以上就是词组。这是最明确的一种写法，不设段数上限——否则
+       列了 7 个同义词的一行会被当句子丢掉；
+    2. **整行是一条纯英文词组**（`in charge of`）：收为词组。这里绝不能退回
+       「取第一个词」，那会把 `live to tell` 截成 `live` 写进生词本——写错了
+       内容，而那条词条在列表里看着还挺正常，用户很难发现；
+    3. **其余情况取第一个词**（`apple 苹果`、`1. ubiquitous /…/ adj.`）。
+
+    超过 `MAX_WORDS_PER_PHRASE` 词的纯英文行不是词组，也不是词表，按句子跳过
+    并说明词数——用户才知道该把它删掉还是拆开。
     """
     s = line
     # 行首的编号与项目符号：不属于词本身，但会影响「第一个词是哪段」
@@ -859,62 +938,122 @@ def _words_in_line(line: str) -> tuple[list[str], str, list[str]]:
             cut = min(cut, found.start())
     s = s[:cut]
     if not s.strip():
-        return [], "", []
+        return _LinePick()
 
     tokens = _tokens_in(s)
     if not tokens:
-        return [], "", []
+        return _LinePick()
 
-    # 用分隔符明确列开的纯词（「happy, glad, joyful」）：段数不限，全取。
-    # 这条分支必须在阈值判断**之前**——否则列了 7 个同义词的一行会被
-    # 当成句子丢掉。
     segments = [seg.strip() for seg in _SPLIT_RE.split(s) if seg.strip()]
     listed = len(segments) > 1 and all(_is_plain_segment(seg) for seg in segments)
+    # 这条阈值必须在「列开的纯词表」判断**之后**：列了 7 段的一行按段收，
+    # 不受句子阈值限制。
     if not listed and len(tokens) > MAX_WORDS_PER_LINE:
-        return [], f"一行有 {len(tokens)} 个词，像是句子不是词条", []
+        return _LinePick(reason=f"一行有 {len(tokens)} 个词，像是句子不是词条")
 
-    picks: list[str]
     if listed:
-        picks = segments
-    else:
-        flat = s.strip()
-        if len(tokens) > 1 and _PLAIN_SEGMENT_RE.fullmatch(flat):
-            # 整行就是一个**纯英文词组**（`live to tell` / `in charge of`）：
-            # 这里不能退回「取第一个词」——那会把一条词组截成 `live` 写进生词本，
-            # 属于**写错内容**，而且这个词条在列表里看着还挺正常，用户很难发现。
-            # 如实报出来，用户才知道该把它收进词组收藏。
-            return [], "", [_reject_note(flat)]
-        picks = [tokens[0]]
-    kept: list[str] = []
+        return _finalize(
+            [seg for seg in segments if len(_tokens_in(seg)) == 1],
+            [seg for seg in segments if len(_tokens_in(seg)) > 1],
+            line,
+        )
+
+    flat = s.strip()
+    if len(tokens) > 1 and _PLAIN_SEGMENT_RE.fullmatch(flat):
+        if len(tokens) <= MAX_WORDS_PER_PHRASE:
+            return _LinePick(phrases=[" ".join(flat.split())])
+        return _LinePick(
+            reason=(
+                f"这一行有 {len(tokens)} 个词，超过词组的 "
+                f"{MAX_WORDS_PER_PHRASE} 词上限，像是句子，未收录"
+            )
+        )
+    return _finalize([tokens[0]], [], line)
+
+
+def _finalize(words: list[str], phrases: list[str], line: str) -> _LinePick:
+    """把候选分成「能收的词 / 能收的词组 / 要报告的段」，并在全空时给出原因。
+
+    词的校验与词组的校验**各用各的判据**（`_valid_word` / `_valid_phrase`），
+    不合并成一个：词的合法性（长度、字符集）与词组的合法性（词数区间）是两件
+    事，合成一条就意味着放宽词组时要连带动词的判据。
+    """
+    kept_words: list[str] = []
+    kept_phrases: list[str] = []
     rejected: list[str] = []
-    for pick in picks:
+    for pick in words:
         if pick.lower() in _POS_MARKERS:
             continue
         # **判据前先归一化**：`Apple` 与 `apple` 是同一个词，而 `_WORD_RE` 只认
         # 小写形态——少了这一步，大小写混排的词表会把每个大写行都报成「不是单词」
         # （`_collect` 那边本来就会先 normalize，这里必须与它同一口径）。
         if _valid_word(normalize(pick)):
-            kept.append(pick)
+            kept_words.append(pick)
         else:
-            # 走到这里又过不了 `_valid_word` 的，只可能是**含空格的段**
-            # （字符集已经挡住数字与标点）或单字母（`a` 短于 MIN_WORD_LEN）。
-            # 它们不是词条，但要进报告——见 docstring。
             rejected.append(pick)
-    if not kept:
+    for pick in phrases:
+        if _valid_phrase(pick):
+            kept_phrases.append(" ".join(pick.split()))
+        else:
+            rejected.append(pick)
+
+    if not kept_words and not kept_phrases:
         if rejected:
-            # 整行都是词组：让逐条说明来交代，不再叠一句笼统的「没认出单词」。
-            return [], "", [_reject_note(seg) for seg in rejected]
+            # 整行都收不下：让逐条说明来交代，不再叠一句笼统的「没认出单词」。
+            return _LinePick(rejected=[_reject_note(seg) for seg in rejected])
         # 有「词」但一个都收不下（只有词性标记、整行都是被剥掉的括号内容）。
         # 不能说成「空行」轻轻放过——用户会以为这行本来就没事。
-        return [], f"没认出可收录的单词：{line[:40]}", []
-    return kept, "", [_reject_note(seg) for seg in rejected]
+        return _LinePick(reason=f"没认出可收录的单词：{line[:40]}")
+    return _LinePick(
+        words=kept_words,
+        phrases=kept_phrases,
+        rejected=[_reject_note(seg) for seg in rejected],
+    )
+
+
+def _valid_phrase(text: str) -> bool:
+    """一条词组是否可收录：字符集合法，词数在 `MIN..MAX_WORDS_PER_PHRASE` 之间。
+
+    字符集用的是与「纯词表的一段」同一份 `_PLAIN_SEGMENT_RE`——词组里出现
+    数字或标点（`3.0 version`、`word,`）说明这不是用户想收的搭配。
+    """
+    if not _PLAIN_SEGMENT_RE.fullmatch(text):
+        return False
+    return MIN_WORDS_PER_PHRASE <= len(_tokens_in(text)) <= MAX_WORDS_PER_PHRASE
+
+
+def _collect_phrase(
+    result: ParseResult, seen: dict[str, int], raw: str, line_no: int
+) -> bool:
+    """收下一条词组：折叠空白、查重、按词组身份放进 `words`。
+
+    查重用**独立的一张表**（`seen` 由调用方分开传），与单词那边不共用：同一个
+    `seen` 字典会让 `take off` 与某个词共用一个键空间，而它们进的是两张表，
+    「重复」在两边是不同的意思。词组按小写判重，与 `phrases` 表上的
+    `COLLATE NOCASE` 同一口径——否则 `Take Off` 与 `take off` 在文件里算两条，
+    进了库却撞唯一约束，后一条会被静默丢弃。
+    """
+    phrase = " ".join((raw or "").split())
+    if not _valid_phrase(phrase):
+        return False
+    key = phrase.lower()
+    if key in seen:
+        result.duplicates += 1
+        return False
+    seen[key] = line_no
+    result.words.append(ParsedWord(word=phrase, line=line_no, kind=KIND_PHRASE))
+    return True
 
 
 def _reject_note(seg: str) -> str:
-    """一句能让用户照着改的说明。含空格与「过短」是两种完全不同的毛病。"""
-    if " " in seg.strip():
-        return f"「{seg}」含空格，像是词组不是单词，未收录"
-    return f"「{seg}」太短或不是单词，未收录"
+    """一句能让用户照着改的说明。词数越界与「过短」是两种完全不同的毛病。"""
+    text = seg.strip()
+    count = len(_tokens_in(text))
+    if " " in text and count > MAX_WORDS_PER_PHRASE:
+        return f"「{text}」有 {count} 个词，超过词组的 {MAX_WORDS_PER_PHRASE} 词上限，未收录"
+    if " " in text:
+        return f"「{text}」不是可收录的词组（含数字或标点？），未收录"
+    return f"「{text}」太短或不是单词，未收录"
 
 
 def _tokens_in(text: str) -> list[str]:
@@ -980,14 +1119,22 @@ def run_import(
     on_progress=None,
     is_cancelled=None,
 ) -> ImportOutcome:
-    """逐个查词并入库，返回分类结果。
+    """逐个查询并入库，返回分类结果。
+
+    两种候选走两条路：`KIND_WORD` 走 `service.lookup`（写 entries），
+    `KIND_PHRASE` 走 `service.lookup_phrase`（写 phrases）。分派在这一层做，
+    因为解析器只负责判断「这条东西是什么」，不该知道库里长什么样。
 
     **「新增」与「已存在」靠 id 快照判定**，不看 `lookup()` 的第二个返回值：
     那个只说明「是否命中缓存」，而别名命中（running → 已有词条 run）同样
     算缓存命中——把这种说成「新增」会让报告里的数字虚高，用户按它对不上账。
+    词组那条路用的是 `lookup_phrase` 自己给的「本次是否新增」，它按收藏条数
+    有没有涨来判，判据只有那一处。
 
     `known` 允许外部传入同一个 set 跨批次累积，这样分块导入时每块不必
-    重新扫一遍全库的 id。
+    重新扫一遍全库的 id。**词组 id 不进这个集合**：它是 entries 的 id 空间，
+    两张表各自从 1 发号，把词组的 3 号混进去，一个同样叫 3 号的词条就会被
+    当成「已存在」直接跳过——库里明明没有，报告却说有。
     """
     if known is None:
         known = repo.all_ids()
@@ -1000,6 +1147,21 @@ def run_import(
             break
         if on_progress is not None:
             on_progress(index, total, item.word)
+
+        if item.kind == KIND_PHRASE:
+            try:
+                phrase, created = service.lookup_phrase(item.word)
+            except Exception as exc:  # noqa: BLE001 - 一条失败不该中断整批
+                outcome.failed.append((item.word, str(exc) or exc.__class__.__name__))
+                continue
+            if phrase is None or phrase.id is None:
+                outcome.failed.append((item.word, "查询没有返回词组"))
+                continue
+            (outcome.phrases_added if created else outcome.phrases_existing).append(
+                phrase.phrase
+            )
+            continue
+
         try:
             entry, _cached = service.lookup(item.word)
         except Exception as exc:  # noqa: BLE001 - 一个词失败不该中断整批导入

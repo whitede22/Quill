@@ -1547,14 +1547,30 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         # 函数体，只把 `processEvents` 那行删掉，文件直接「expected an indented
         # block」——变异被 `ast.parse` 守卫记成 `[BAD]`。报表上它和「没抓住」并列
         # 在同一个结论里，读起来像「这条保护形同虚设」，其实是**变异自己写错了**。
+        #
+        # 锚点还要跟着实现走：补「两次事件处理」那次改动（一次 hide、一次重绘）
+        # 把这一行包进了 `for _ in range(2)`。锚点若仍按单行写，`count(old)` 就是
+        # 0，残留检测器报「干净状态下误报残留」——读起来像仓库被污染，其实只是
+        # 锚点陈旧。
         "main_window 收尾不补事件处理（进度框停在 100% 不掉）",
         "app/ui/main_window.py",
         "    app = QApplication.instance()\n"
         "    if app is not None:\n"
-        "        app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)\n",
+        "        for _ in range(2):\n"
+        "            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)\n",
         "    app = QApplication.instance()\n"
         "    if app is not None:\n"
         "        pass  # 变异：收尾不补事件处理，进度框停在屏幕上\n",
+        "scripts/gui_smoke.py",
+        "收尾补了排除用户输入的事件处理",
+    ),
+    (
+        # 「两次」不是顺手写的数：只 hide 不重绘，屏幕上还是原来那一帧 100%。
+        # 判据直接数收尾时调了几次 processEvents，所以把 2 改成 1 必须红。
+        "main_window 收尾只补一次事件处理（重绘没跟上，屏幕停在 100%）",
+        "app/ui/main_window.py",
+        "        for _ in range(2):\n",
+        "        for _ in range(1):  # 变异：只补一次，重绘没跟上\n",
         "scripts/gui_smoke.py",
         "收尾补了排除用户输入的事件处理",
     ),
@@ -1568,6 +1584,41 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         "        app.processEvents()\n",
         "scripts/gui_smoke.py",
         "收尾补了排除用户输入的事件处理",
+    ),
+    # ---- 词组（v1.1.0）----
+    #
+    # 词组的整条链路是「解析器判定 → run_import 分派 → service 写另一张表」。
+    # 每一段接错时界面都照常出报告，所以每段都得有一条能失败的判据。
+    (
+        # 上限写成 2：`look down upon` 这类 3 词搭配会被当成句子跳过。判据认的是
+        # 「3 词还收得下」，它与「4 词以上按句子跳过」是同一根线的两端。
+        "importer.py 词组词数上限收紧到 2（3 词搭配被当句子）",
+        "app/core/importer.py",
+        "MAX_WORDS_PER_PHRASE = 4\n",
+        "MAX_WORDS_PER_PHRASE = 2\n",
+        "scripts/selfcheck.py",
+        "导入：词组的词数上限取 4（3 词的搭配收得下）",
+    ),
+    (
+        # 分派写死成「都当单词」：词组会走 `service.lookup` 进生词本，而
+        # `take off` 在离线词库里查不到，于是报告说「失败 1 条」——看着像词库
+        # 没收录，实际是走错了集合。
+        "importer.py 不按 kind 分派（词组一律当单词查）",
+        "app/core/importer.py",
+        "        if item.kind == KIND_PHRASE:\n",
+        "        if False:  # 变异：词组一律当单词查\n",
+        "scripts/selfcheck.py",
+        "导入：词组进词组收藏，不进生词本",
+    ),
+    (
+        # 摘掉「单个词不是词组」这一关：同一个词会在生词本与词组收藏里各存
+        # 一份，删了一边另一边还在，而两边都叫「释义」。
+        "dictionary.py 不再拒绝单个词当词组（两个集合各存一份）",
+        "app/core/dictionary.py",
+        '        if " " not in surface:\n',
+        "        if False:  # 变异：不再区分单词与词组\n",
+        "scripts/selfcheck.py",
+        "词组：单个词在词组模式下被拒绝并指路",
     ),
 ]
 

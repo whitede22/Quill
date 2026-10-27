@@ -7,7 +7,7 @@ import string
 from ..providers.base import DictionaryProvider, ProviderError
 from ..providers.prompts import PROMPT_VERSION
 from . import lemmatizer
-from .models import Entry
+from .models import Entry, Phrase
 from .repository import Repository
 
 _PUNCT = string.punctuation + " \t\r\n\u3000"
@@ -20,6 +20,24 @@ def normalize(word: str) -> str:
         probe = w.replace("-", "").replace("'", "")
         if probe.isalpha():
             w = w.lower()
+    return w
+
+
+def normalize_phrase(text: str) -> str:
+    """规整词组输入：折叠空白、去首尾标点、纯英文则转小写。
+
+    **不能复用 `normalize()`**：它判「纯字母」用的是 `probe.isalpha()`，而词组
+    里必然有空格，于是 `Take Off` 会原样保留大小写。词组表按 NOCASE 去重，库里
+    存的是小写那份，两串在 Python 里却是两个不同的字符串——缓存永远命不中，
+    用户每查一次都会多打一次接口，而界面上看起来「已经收藏过了」。
+
+    所以这里先把空格摘掉再判：`Take Off` → `takeoff` 是纯字母，于是整串转小写。
+    """
+    w = " ".join((text or "").split())
+    w = w.strip(_PUNCT)
+    probe = w.replace(" ", "").replace("-", "").replace("'", "")
+    if w and w.isascii() and probe.isalpha():
+        w = w.lower()
     return w
 
 
@@ -138,6 +156,66 @@ class DictionaryService:
         return self.lookup(
             word, use_cache=False, accept_fallback=accept_fallback
         )[0]
+
+    def lookup_phrase(self, text: str) -> tuple[Phrase, bool]:
+        """查一条词组。返回 (词组, 是否本次新增)。
+
+        与 `lookup` 的差别不止「查表不同」，每一处都是「词条有、词组没有」：
+
+        - 缓存只有一张表。`phrases` 按内容唯一（NOCASE），没有别名表，也没有
+          词形归并——词组没有屈折变化这回事，`take off` 的过去式不是另一条
+          词组，而是同一句子里的事；
+        - 不写 `entries`，也绝不借道 `upsert`。两张表各自从 1 发号，写错表
+          不会报错，只会在另一个集合里多出一条同号、毫不相干的数据；
+        - 不碰提示词版本。`phrases` 没有那一列，所以词组不参与「待重查」的
+          判定——这也是它不出现在批量重查里的原因（见 `_sync_mode_buttons`）。
+
+        「是否新增」按**收藏条数有没有涨**判定，与详情区那个「收藏」按钮同一
+        判据：`add_phrase` 是幂等的，它返回的行在「刚写进去」与「本来就存在」
+        两种情况下长得一样，分不出来。
+        """
+        surface = normalize_phrase(text)
+        if not surface:
+            raise ValueError("请输入要查询的词组")
+        if " " not in surface:
+            # 单个词在词组模式下查，会在词组收藏里留下一条与生词本重复的记录：
+            # 同一份内容两个集合各存一份，删了一边另一边还在，而界面上都叫
+            # 「释义」。这个动作没有正确的落点，所以拒绝并指路。
+            raise ProviderError(
+                f"「{surface}」是单个词，不是词组。\n"
+                "查单词请切到左栏「生词本」再查，那样才会进生词本。"
+            )
+
+        stored_hit = self.repo.get_phrase(surface)
+        if stored_hit is not None:
+            return stored_hit, False
+
+        lookup = getattr(self.provider, "lookup_phrase", None)
+        if lookup is None:
+            # Provider 协议里有这个方法，但测试替身与将来可能的第三方实现未必
+            # 都提供。AttributeError 会直接糊到界面上，用户只能看到一句
+            # 「'XxxProvider' object has no attribute 'lookup_phrase'」。
+            name = str(getattr(self.provider, "name", "") or "")
+            raise ProviderError(
+                f"当前接入方式（{name or '未知'}）不支持词组查询。\n"
+                "到右上角「设置」里接上接口后再试。"
+            )
+
+        phrase = lookup(surface)
+        phrase.phrase = " ".join((phrase.phrase or surface).split())
+        # 空壳拒收，与词条同一条理由：只有标题、没有简释的行，在列表里看着
+        # 正常，点开是空的，还会被一并导出。
+        if not phrase.gloss_zh:
+            raise ProviderError(
+                f"接口没有返回「{surface}」的释义，请重试。"
+            )
+        # 它不是从某个词的搭配区收藏来的，`source_lemma` 保持空——填上用户
+        # 输入的原串会让「按来源词筛选词组」多出一批查不到出处的行。
+        phrase.source_lemma = ""
+
+        before = self.repo.count_phrases()
+        stored = self.repo.add_phrase(phrase)
+        return stored, self.repo.count_phrases() > before
 
     def cached(self, word: str) -> Entry | None:
         """只在本地缓存里找，**绝不发网络请求**。

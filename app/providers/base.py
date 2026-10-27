@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from ..core.models import Entry
+from ..core.models import Entry, Phrase
 
 
 class ProviderError(RuntimeError):
@@ -25,6 +25,16 @@ class DictionaryProvider(Protocol):
 
     def lookup(self, word: str) -> Entry:
         """查询单个词条，返回结构化 Entry（不含入库字段）。"""
+        ...
+
+    def lookup_phrase(self, phrase: str) -> Phrase:
+        """查询一条词组，返回结构化 Phrase（不含入库字段）。
+
+        与 `lookup` 分开而不是复用它：两者的输出结构不同（词组没有音标、
+        词性、同义语），产物也要落进另一张表。混成一个方法，调用方就得
+        再判一次「这次拿到的东西该进哪张表」，而那个判断本来就该由
+        「方法的名字」承担。
+        """
         ...
 
 
@@ -71,3 +81,21 @@ def provider_label(name: str) -> str:
     """把来源标识翻译成界面用语；未知标识原样返回，不隐藏信息。"""
     key = (name or "").strip().lower()
     return PROVIDER_LABELS.get(key, name or "")
+
+
+# 哪些来源**结构上**给不出词组。
+#
+# 判据是「有没有这类数据」，不是「试一次看看」：内置离线词库在构建时就把含
+# 空格的条目排除掉了（`scripts/build_offline_dict.py` 的 PLAIN_WORD_COND 只
+# 保留 `[a-z-]` 组成的词），实测 49527 条里含空格的为 0 条。所以离线模式下查
+# 词组不是「这次没查着」，而是这个来源里根本没有——界面据此直接拒绝并说明
+# 出路，比让用户看一串失败诚实。
+#
+# 未登记的来源按「能给」处理，与 `ALL_FIELDS` 的乐观口径一致：判错的代价是
+# 一次说明清楚的报错；反过来判错，用户会以为这个功能不存在。
+PHRASE_INCAPABLE = frozenset({"offline"})
+
+
+def supports_phrases(name: str) -> bool:
+    """该来源能不能查词组。"""
+    return (name or "").strip().lower() not in PHRASE_INCAPABLE

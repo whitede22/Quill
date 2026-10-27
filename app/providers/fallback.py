@@ -21,7 +21,7 @@
 
 from __future__ import annotations
 
-from ..core.models import Entry
+from ..core.models import Entry, Phrase
 from .base import DictionaryProvider, ProviderError
 
 
@@ -47,3 +47,14 @@ class FallbackProvider:
             entry.source = self.fallback.name
             entry.fallback_reason = str(exc)
             return entry
+
+    def lookup_phrase(self, phrase: str) -> Phrase:
+        """词组**不兜底**，只问接口。
+
+        兜底在这里帮不上忙：离线词库结构上不含词组（构建时就排除了含空格的
+        条目），回落过去必然再失败一次。而失败一次之后抛哪个错是个真问题——
+        `lookup` 那边刻意抛原始接口错误，因为离线「未收录」会把密钥失效伪装成
+        词库容量问题；词组这条路径更彻底：回落本身就是空动作，只是把同一个
+        失败多绕一圈、外加一句误导性的「离线未收录」。
+        """
+        return self.primary.lookup_phrase(phrase)

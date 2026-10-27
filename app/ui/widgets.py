@@ -440,7 +440,8 @@ class EntryDetail(QWidget):
         if phrase is None:
             self._render_placeholder(
                 "在左侧选中一条词组，这里显示它的释义与例句。\n"
-                "词组来自查词时右侧「固定搭配」区的「收藏」。"
+                "词组有两个来源：查词时右侧「固定搭配」区的「收藏」，"
+                "以及在这个模式下直接输入词组查询。"
             )
             return
 

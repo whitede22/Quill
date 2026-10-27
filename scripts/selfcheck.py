@@ -44,7 +44,11 @@ from app.core.db import (  # noqa: E402
     init_db,
     to_bigram,
 )
-from app.core.dictionary import DictionaryService, normalize  # noqa: E402
+from app.core.dictionary import (  # noqa: E402
+    DictionaryService,
+    normalize,
+    normalize_phrase,
+)
 from app.core.exporter import (  # noqa: E402
     PdfFontUnavailable,
     build_pdf_html,
@@ -61,7 +65,7 @@ from app.ui import theme as theme_mod  # noqa: E402
 from app.ui import background as background_mod  # noqa: E402
 from app.ui.background import BackgroundRenderer, apply_blur, scale_cover  # noqa: E402
 from app.ui import onboarding as ob_mod  # noqa: E402
-from app.core.models import Entry, Synonym, join_tags, split_tags  # noqa: E402
+from app.core.models import Entry, Phrase, Synonym, join_tags, split_tags  # noqa: E402
 from app.core.repository import Repository, build_fts_query  # noqa: E402
 from app.providers.base import DictionaryProvider  # noqa: E402
 from app.providers.mock import MockProvider  # noqa: E402
@@ -2748,36 +2752,53 @@ def main() -> int:
         _imp_fake_err or "没报错——说明假 docx 被当成真的读过去了",
     )
 
-    # 一行逗号列开的长词表：**单词照收、短语如实报告**。
+    # 一行逗号列开的长词表：**单词与词组各归各家**。
     # 旧实现要求「每一段都是单个词」，夹一条短语就让整条分支不成立，整行
     # 随即被 `MAX_WORDS_PER_LINE` 判成句子——一份 57 段的词表收 0 个词。
+    # 后来那段短语能识别了却**只报不收**；现在它们按词组收进另一张表。
     _imp_long = parse_text(
         "perish, impractical, oblivious, live to tell, generally speaking, look down upon"
     )
     check(
-        "导入：一行逗号列开的词表整行收下（不因夹着短语就作废）",
-        [w.word for w in _imp_long.words] == ["perish", "impractical", "oblivious"],
-        str([w.word for w in _imp_long.words]),
+        "导入：一行逗号列开的词表整行收下（单词与词组各归各家）",
+        [w.word for w in _imp_long.words if w.kind == "word"]
+        == ["perish", "impractical", "oblivious"]
+        and [w.word for w in _imp_long.words if w.kind == "phrase"]
+        == ["live to tell", "generally speaking", "look down upon"]
+        and not _imp_long.skipped,
+        f"words={[(w.word, w.kind) for w in _imp_long.words]} skipped={_imp_long.skipped}",
     )
     check(
-        "导入：长词表里的短语如实报告，不截成首词",
-        len(_imp_long.skipped) == 3
-        and not any(w.word in ("live", "generally", "look") for w in _imp_long.words)
-        and all(
-            any(k in reason for k in ("live to tell", "generally speaking", "look down upon"))
-            for _, reason in _imp_long.skipped
-        ),
-        f"words={[w.word for w in _imp_long.words]} skipped={_imp_long.skipped}",
+        "导入：长词表里的短语不截成首词",
+        not any(w.word in ("live", "generally", "look") for w in _imp_long.words),
+        str([w.word for w in _imp_long.words]),
     )
     # 单独占一行的词组同样不能截首词。`picks = [tokens[0]]`（一行取第一个词）
     # 是给「apple 苹果」「1. ubiquitous /…/ adj.」这类行准备的，落到词组上就
     # 变成往生词本里写一个 `live`——看着像正常词，用户根本发现不了。
     _imp_phrase = parse_text("live to tell\napple\n")
     check(
-        "导入：整行就是一个词组时如实报告，不截成首词",
-        [w.word for w in _imp_phrase.words] == ["apple"]
-        and len(_imp_phrase.skipped) == 1,
-        f"words={[w.word for w in _imp_phrase.words]} skipped={_imp_phrase.skipped}",
+        "导入：整行就是一个词组时收为词组，不截成首词",
+        [(w.word, w.kind) for w in _imp_phrase.words]
+        == [("live to tell", "phrase"), ("apple", "word")]
+        and not _imp_phrase.skipped,
+        f"words={[(w.word, w.kind) for w in _imp_phrase.words]} skipped={_imp_phrase.skipped}",
+    )
+    # 超过 4 词的纯英文行仍按句子跳过，**而且要说清是几个词**：只报一句
+    # 「像是句子」，用户没法判断该删掉还是该拆开。这条同时守住「词组的
+    # 词数上限真的生效」——上限写成无穷大时它必须红。
+    _imp_long_phrase = parse_text("as a matter of fact\n")
+    check(
+        "导入：超过词组词数上限的行按句子跳过并说明词数",
+        not _imp_long_phrase.words
+        and len(_imp_long_phrase.skipped) == 1
+        and "5 个词" in _imp_long_phrase.skipped[0][1],
+        f"words={[w.word for w in _imp_long_phrase.words]} skipped={_imp_long_phrase.skipped}",
+    )
+    check(
+        "导入：词组的词数上限取 4（3 词的搭配收得下）",
+        [w.word for w in parse_text("look down upon\n").words] == ["look down upon"],
+        str([w.word for w in parse_text("look down upon\n").words]),
     )
 
     # 用**真的导出器**生成文件再解析回来。手写样本只能证明「我以为的格式」
@@ -2960,6 +2981,94 @@ def main() -> int:
         "导入：可取消，且取消后一个词都不处理",
         _imp_cancel.cancelled and _imp_cancel.handled == 0,
         f"cancelled={_imp_cancel.cancelled} handled={_imp_cancel.handled}",
+    )
+
+    # ---- 导入：词组进另一张表 ----
+    #
+    # 词组与生词本**是两张各自从 1 发号的表**，所以这里用一个独立的库，
+    # 连 id 撞车也一起造成（词组 1 号与词条 1 号同时存在）。
+    class _ImpPhraseProvider:
+        """词组专用替身：单词转发给离线词库，词组自己答。"""
+
+        name = "openai-compat"
+
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.phrase_calls: list[str] = []
+
+        def lookup(self, word: str) -> Entry:
+            return self.inner.lookup(word)
+
+        def lookup_phrase(self, text: str) -> Phrase:
+            self.phrase_calls.append(text)
+            if text == "empty gloss":
+                # 空壳：只有标题、没有简释。存进去就是一条点开是空的记录。
+                return Phrase(phrase=text, gloss_zh="")
+            return Phrase(
+                phrase=text,
+                gloss_zh=f"{text} 的简释",
+                example="They did it yesterday.",
+                example_zh="他们昨天做了这件事。",
+            )
+
+    _ph_conn = connect(tmpdir / "import_phrase.db")
+    init_db(_ph_conn)
+    _ph_repo = Repository(_ph_conn)
+    _ph_prov = _ImpPhraseProvider(OfflineDictProvider())
+    _ph_svc = DictionaryService(_ph_repo, _ph_prov)
+
+    _ph_out = run_import(
+        _ph_svc, _ph_repo, parse_text("take off\napple\nempty gloss\n").words
+    )
+    check(
+        "导入：词组进词组收藏，不进生词本",
+        _ph_out.phrases_added == ["take off"]
+        and _ph_repo.count_phrases() == 1
+        and _ph_repo.get("take off") is None,
+        f"phrases={_ph_out.phrases_added} 词组={_ph_repo.count_phrases()} "
+        f"生词本={_ph_repo.count()}",
+    )
+    check(
+        "导入：同批的单词照常进生词本（词组的 id 没混进 id 快照）",
+        _ph_out.added == ["apple"] and not _ph_out.existing and _ph_repo.count() == 1,
+        f"added={_ph_out.added} existing={_ph_out.existing} count={_ph_repo.count()}",
+    )
+    check(
+        "导入：词组返回空壳时计入失败，不写库",
+        [w for w, _ in _ph_out.failed] == ["empty gloss"]
+        and _ph_repo.get_phrase("empty gloss") is None,
+        f"failed={_ph_out.failed}",
+    )
+    check(
+        "导入：词组的三个分类也计入「处理过的条数」",
+        _ph_out.handled == 3,
+        f"handled={_ph_out.handled}",
+    )
+
+    _ph_calls_before = len(_ph_prov.phrase_calls)
+    _ph_again = _ph_svc.lookup_phrase("  Take   Off ")
+    check(
+        "词组：空白与大小写变异命中同一条，不再打接口",
+        _ph_again[0].phrase == "take off"
+        and _ph_again[1] is False
+        and len(_ph_prov.phrase_calls) == _ph_calls_before,
+        f"phrase={_ph_again[0].phrase} created={_ph_again[1]} "
+        f"calls+={len(_ph_prov.phrase_calls) - _ph_calls_before}",
+    )
+    try:
+        _ph_svc.lookup_phrase("apple")
+        _ph_word_err = ""
+    except Exception as exc:  # noqa: BLE001 - 要看住的是「有没有拒绝」
+        _ph_word_err = str(exc)
+    check(
+        "词组：单个词在词组模式下被拒绝并指路",
+        "不是词组" in _ph_word_err and "生词本" in _ph_word_err,
+        _ph_word_err or "没拒绝",
+    )
+    check(
+        "词组：normalize_phrase 折叠空白并小写化",
+        normalize_phrase("  Look Forward TO  ") == "look forward to",
+        repr(normalize_phrase("  Look Forward TO  ")),
     )
 
     # ---- 导入：认出本程序导出的 JSON ----

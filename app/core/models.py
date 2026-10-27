@@ -206,6 +206,35 @@ class Phrase:
             created_at=row["created_at"],
         )
 
+    @classmethod
+    def from_payload(cls, raw: object, phrase: str) -> "Phrase":
+        """从接口返回的 JSON 构造一条词组。
+
+        键名容错与 `Collocation.from_raw` 同源：模型返回的键名不受控，只认
+        一种写法会丢掉大半内容，而且**不报错**。
+
+        `phrase` 是用户输入的那条。模型给了规范形态（输入 `took off`、回来
+        `take off`）就用模型的：词组表按内容去重，存一个规范写法比存当时的
+        输入更有用。模型没给、或给了空白，回落到用户输入——绝不写一条空词组，
+        那是整表里唯一无法用内容定位的行。
+        """
+        payload = raw if isinstance(raw, dict) else {}
+
+        def _pick(*keys: str) -> str:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return " ".join(value.split())
+            return ""
+
+        text = _pick("phrase", "collocation", "term") or " ".join((phrase or "").split())
+        return cls(
+            phrase=text,
+            gloss_zh=_pick("gloss_zh", "gloss", "zh"),
+            example=_pick("example", "example_en", "sentence"),
+            example_zh=_pick("example_zh", "zh_example", "translation"),
+        )
+
     def to_entry(self) -> Entry:
         """适配成 `Entry`，让列表卡片与六种导出**复用同一条路径**。
 

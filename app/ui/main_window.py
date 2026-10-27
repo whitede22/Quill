@@ -60,7 +60,7 @@ from ..core import review
 from ..core.models import Entry, Phrase, join_tags
 from ..core.repository import Repository
 from ..providers import build_provider, provider_status
-from ..providers.base import provided_fields, provider_label
+from ..providers.base import provided_fields, provider_label, supports_phrases
 from ..security.keystore import load_api_key
 from .background import BackgroundRenderer
 from .export_dialog import EXPORT_FORMATS, ExportDialog, FormatHelpDialog
@@ -749,11 +749,20 @@ class MainWindow(QMainWindow):
         words = self._mode == MODE_WORDS
         self.btn_mode_words.setChecked(words)
         self.btn_mode_phrases.setChecked(not words)
-        # 重查只对词条有意义：词组是用户从固定搭配里收下来的，没有接口内容，
-        # 也没有「过时」这回事。切到词组模式就藏起来，别留一个点了没反应的按钮。
+        # 重查只对词条有意义：词组没有提示词版本列，也就没有「过时」这个概念
+        # （见 `DictionaryService.lookup_phrase` 的说明）。切到词组模式就藏起来，
+        # 别留一个点了没反应的按钮。
         self.btn_refresh_all.setVisible(words)
         self.filter.setPlaceholderText(
             "搜索生词本（支持中文）" if words else "搜索词组收藏"
+        )
+        # 输入框的语义随集合变：同一个框在两个模式下查的是两种东西。占位文字
+        # 必须跟着改，否则用户在词组模式里输入 `take off`，看到提示还写着
+        # 「输入英语单词」，会以为是程序把词组拆错了。
+        self.input.setPlaceholderText(
+            "输入英语单词，回车查询并收藏"
+            if words
+            else "输入英语词组，回车查询并收藏，如 take off"
         )
 
     def _refresh_review_count(self) -> None:
@@ -1068,15 +1077,19 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message)
 
     def _do_lookup(self) -> None:
-        """输入框回车：一个词就查一个词，一串词就批量收录。
+        """输入框回车：一个词就查一个词，一串词就批量收录；词组模式下查词组。
 
-        这是**用户实际的使用姿势**：读文章时攒一串生词，一次粘进来。此前这里
-        把整串当作一个词去查——粘 10 个词得到 1 条 lemma 是「hello world warm
-        …」的记录，既不报错也不提示，用户以为 10 个词都收进去了。
+        **模式决定语义**，不靠猜。生词本模式下这是「用户实际的使用姿势」：
+        读文章时攒一串生词一次粘进来。此前这里把整串当作一个词去查——粘 10
+        个词得到 1 条 lemma 是「hello world warm …」的记录，既不报错也不提示，
+        用户以为 10 个词都收进去了。
 
         「一串」的判据不是「有没有空格」，而是**整串在本地有没有**：`ice cream`
         与 `New York` 都是带空格的单个词条，盲拆会把它们拆成四个词。所以先拿
         整串查一次本地缓存（只在本地找，不发网络请求），命中就当词组。
+
+        词组模式下**整行当作一条词组**：`take off` 不该被拆成 take 与 off 收进
+        生词本——那是写错集合，而且两条词条看着都正常，用户很难发现。
         """
         text = self.input.text().strip()
         if not text:
@@ -1086,6 +1099,9 @@ class MainWindow(QMainWindow):
             # 批量重查虽自成一套，但它也在同一张表上连续写，混进来同样会把
             # 进度与报告搅乱。
             QMessageBox.information(self, "查询", "上一批还在处理，请稍等片刻。")
+            return
+        if self._mode == MODE_PHRASES:
+            self._lookup_phrase(text)
             return
         words = split_words(text)
         if len(words) <= 1:
@@ -1127,6 +1143,72 @@ class MainWindow(QMainWindow):
             on_error=lambda message, s=seq: self._on_error(message, s),
             on_finished=lambda s=seq: self._finish_content(s),
         )
+
+    def _phrase_blocked_reason(self) -> str:
+        """当前来源给不出词组时返回一句说明，否则返回空串。
+
+        判据看**真实生效的 provider**，不看 `config["provider"]`——接口模式下
+        没配密钥时 `build_provider()` 会静默退回离线词库，而 config 里仍写着
+        "openai-compat"。按 config 判的话，用户会在「接口模式」下点查询词组、
+        然后拿到一句「离线词库未收录」，完全对不上自己看到的那行状态。
+        """
+        name = str(getattr(self.service.provider, "name", "") or "")
+        if supports_phrases(name):
+            return ""
+        return (
+            "本机离线词库只收单词，不含词组，没有可以查询的来源。\n\n"
+            "先到右上角「设置」接上接口，词组才有内容可查。"
+        )
+
+    def _lookup_phrase(self, text: str) -> None:
+        """查一条词组：结果落进词组收藏，**不进生词本**。
+
+        与 `_lookup_word` 分开而不是复用：两者的产物进不同的表，回调里要刷新的
+        也是不同的集合（词组列表 vs 词条列表），合并只会得到一个到处判断
+        「这次是哪种」的函数。
+        """
+        reason = self._phrase_blocked_reason()
+        if reason:
+            QMessageBox.information(self, "查询词组", reason)
+            return
+        self._flush_edits()
+        seq = self._next_seq()
+        self._set_busy(True, f"正在查询词组「{text}」…")
+        submit(
+            self.service.lookup_phrase,
+            text,
+            on_success=lambda result, s=seq: self._on_phrase_ok(result, s),
+            on_error=lambda message, s=seq: self._on_error(message, s),
+            on_finished=lambda s=seq: self._finish_content(s),
+        )
+
+    def _on_phrase_ok(self, result, seq: int) -> None:
+        if not self._is_current(seq):
+            return
+        phrase, created = result
+        self._present_phrase(phrase, created)
+
+    def _present_phrase(self, phrase: Phrase, created: bool) -> None:
+        """把查到的词组呈现到界面。
+
+        顺序与 `_present_entry` 同一套理由：先切集合（切过去会清空
+        `_displayed_id` 并重载一次列表），再声明「详情区显示的是哪一条」，
+        最后带 select_id 重载。反过来的话，重载触发的选中回调会拿这个 id 去
+        比对，发现「已在显示」而跳过——它跳过的是**整份重渲染**，而此刻详情区
+        里还是切换模式时那个空占位。
+        """
+        self.input.clear()
+        if self._mode != MODE_PHRASES:
+            self._switch_mode(MODE_PHRASES)
+        self._displayed_id = phrase.id
+        self.detail.show_phrase(phrase)
+        self._reload_list(select_id=phrase.id)
+        if created:
+            self.statusBar().showMessage(f"{phrase.phrase} — 已收藏到词组收藏")
+        else:
+            self.statusBar().showMessage(
+                f"{phrase.phrase} — 已在词组收藏里，内容以先前那条为准"
+            )
 
     def _refresh_word(self, word: str) -> None:
         if self._refresh_progress is not None:
@@ -1276,7 +1358,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "重新查询",
-                "词组收藏是从固定搭配里收下来的，没有接口内容可以重查。",
+                "词组没有「过时」这回事（词组表没有提示词版本列），"
+                "暂不支持批量重查。\n\n"
+                "想换某条词组的释义：先在词组收藏里把它移出，"
+                "再在词组模式下重新输入——已收藏的同名词组不会被覆盖。",
             )
             return
         blocked = self._refresh_blocked_reason()
@@ -1730,6 +1815,7 @@ class MainWindow(QMainWindow):
         detail_lines: list[str] = []
         failed_lines: list[str] = []
         recognized = 0
+        recognized_phrases = 0
         for path in paths:
             try:
                 text = read_import_text(path)
@@ -1738,11 +1824,16 @@ class MainWindow(QMainWindow):
                 continue
             parsed = parse_text(text)
             recognized += parsed.count
+            recognized_phrases += parsed.phrase_count
             detail_lines.append(
-                f"　{path.name} — {parsed.count} 个（{parsed.source_format}）"
+                f"　{path.name} — {parsed.count} 条（{parsed.source_format}）"
             )
             for item in parsed.words:
-                merged.setdefault(item.word, item)
+                # 键带上 kind：同一个字符串不可能既是单词又是词组，但**列表里
+                # 同时出现两种候选时**，跨文件合并必须按「东西本身」去重，
+                # 而不是按字符串——将来若允许一条词组与某个词同形，这里不会
+                # 悄悄替用户丢掉一条。
+                merged.setdefault(f"{item.kind}:{item.word.lower()}", item)
 
         words = list(merged.values())
         if not words:
@@ -1750,12 +1841,16 @@ class MainWindow(QMainWindow):
                 self,
                 "导入",
                 "这次拖入的 "
-                f"{len(paths)} 个文件里没有认出任何单词。\n\n"
+                f"{len(paths)} 个文件里没有认出任何单词或词组。\n\n"
                 + "\n".join(detail_lines + failed_lines),
             )
             return
 
-        lines = [f"这次拖入 {len(paths)} 个文件，共认出 {recognized} 个单词。"]
+        lines = [
+            f"这次拖入 {len(paths)} 个文件，共认出 {recognized} 条"
+            f"（单词 {recognized - recognized_phrases} 条 · "
+            f"词组 {recognized_phrases} 条）。"
+        ]
         lines.extend(detail_lines)
         if failed_lines:
             lines.append("")
@@ -1763,8 +1858,13 @@ class MainWindow(QMainWindow):
         cross = recognized - len(words)
         if cross > 0:
             lines.append(f"\n跨文件重复 {cross} 个，已合并。")
-        lines.append(f"实际要收录 {len(words)} 个。")
-        lines.append("\n现在开始收录吗？已经在生词本里的会自动跳过。")
+        lines.append(f"实际要收录 {len(words)} 条。")
+        if recognized_phrases and self._phrase_blocked_reason():
+            lines.append(
+                f"\n注意：当前用的是本机离线词库，不含词组，"
+                f"词组会被记为未能收录。要收词组请先到「设置」接上接口。"
+            )
+        lines.append("\n现在开始收录吗？已经收过的会自动跳过。")
 
         if (
             QMessageBox.question(
@@ -1796,10 +1896,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "导入",
-                f"没有从「{path.name}」里认出单词。\n\n"
+                f"没有从「{path.name}」里认出单词或词组。\n\n"
                 f"文件共 {parsed.total_lines} 行。本程序认这些来源：\n"
                 "　· 生词表 —— 每行取第一个英文词，自动忽略行首编号、音标、"
                 "括号和中文释义\n"
+                "　· 词组 —— 整行是 2–4 个纯英文词时按词组收录，进词组收藏\n"
                 "　· Quill 导出的纯文本 / Markdown / JSON —— 按导出格式读\n"
                 "　· 有道单词本导出的 XML —— 按 <word> 与 <trans> 读\n\n"
                 "如果这是本程序导出的纯文本文件，请确认词条行首的编号还在"
@@ -1827,12 +1928,20 @@ class MainWindow(QMainWindow):
         how = _FORMAT_HOW.get(parsed.source_format, _FORMAT_HOW_DEFAULT)
 
         lines = [
-            f"从「{path.name}」里认出 {parsed.count} 个单词"
-            f"（{parsed.source_format}）。",
+            f"从「{path.name}」里认出 {parsed.count} 条"
+            f"（单词 {parsed.word_count} 条 · 词组 {parsed.phrase_count} 条，"
+            f"{parsed.source_format}）。",
             f"识别依据：{how}。",
             "",
             f"　{parsed.preview()}",
         ]
+        if parsed.phrase_count:
+            # 词组与单词进的是两个集合。不写明的话，用户在生词本里找不到刚
+            # 导进来的那几条，会以为收失败了。
+            lines.append(
+                f"\n其中 {parsed.phrase_count} 条是词组，会进「词组收藏」，"
+                "不占生词本的条数。"
+            )
         if parsed.duplicates:
             lines.append(f"\n文件里重复 {parsed.duplicates} 个，已合并。")
         if parsed.skipped:
@@ -1848,7 +1957,15 @@ class MainWindow(QMainWindow):
                 saved = self._save_skipped_list(parsed.skipped)
                 if saved is not None:
                     lines.append(f"（完整清单已写入：{saved}）")
-        lines.append("\n现在开始收录吗？已经在生词本里的会自动跳过。")
+        if parsed.phrase_count and self._phrase_blocked_reason():
+            # 明知会失败就别装没事：离线词库结构上没有词组，这 N 条会一条条
+            # 报「本机离线词库只收单词」。先说清楚，用户还能当场取消去接接口。
+            lines.append(
+                f"\n注意：当前用的是本机离线词库，不含词组，"
+                f"这 {parsed.phrase_count} 条词组会被记为未能收录。"
+                "要收词组，请先到「设置」接上接口。"
+            )
+        lines.append("\n现在开始收录吗？已经收过的会自动跳过。")
 
         return (
             QMessageBox.question(
@@ -1974,8 +2091,14 @@ class MainWindow(QMainWindow):
             return
         outcome = self._import_outcome
         bits = [f"新增 {len(outcome.added)} 条"]
+        # 词组单独报：它与生词本不是一个集合，合并成一个数字，用户对账时
+        # 会发现「说新增 5 条，生词本只多了 3 条」。
+        if outcome.phrases_added:
+            bits.append(f"新增词组 {len(outcome.phrases_added)} 条")
         if outcome.existing:
             bits.append(f"已存在 {len(outcome.existing)} 条")
+        if outcome.phrases_existing:
+            bits.append(f"词组已存在 {len(outcome.phrases_existing)} 条")
         if outcome.failed:
             bits.append(f"未能收录 {len(outcome.failed)} 条")
         if outcome.notes_restored:
@@ -2010,6 +2133,11 @@ class MainWindow(QMainWindow):
             f"新增 {len(outcome.added)} 条 · 已存在 {len(outcome.existing)} 条"
             f" · 未能收录 {len(outcome.failed)} 条"
         )
+        if outcome.phrases_added or outcome.phrases_existing:
+            lines.append(
+                f"词组：新增 {len(outcome.phrases_added)} 条"
+                f" · 已存在 {len(outcome.phrases_existing)} 条（在「词组收藏」里）"
+            )
         if outcome.notes_restored:
             lines.append(f"其中 {outcome.notes_restored} 条从文件里带回了备注。")
 
