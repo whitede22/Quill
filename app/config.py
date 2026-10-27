@@ -53,6 +53,12 @@ DEFAULT_CONFIG: dict = {
     # 默认开启：这类失败都不是用户当场能解决的问题，但「查不到词」会让他
     # 什么都做不了。兜底产出会在详情里标明来源，不会冒充接口结果。
     "offline_fallback": True,
+    # 关闭窗口时留在托盘，全局热键（Alt+Q）随时唤出。
+    # 默认开启：热键的价值就在「窗口没开着的时候按一下」，不常驻的话它退化成
+    # 一个比 Alt+Tab 更慢的切换方式。
+    # 代价必须让用户看得见：关掉窗口 = 程序还在跑。所以第一次收进托盘时会弹一次
+    # 托盘气泡说明，设置里也留了关掉它的开关；关掉之后关闭窗口就真的退出。
+    "tray_enabled": True,
     # 窗口背景图：留空表示不使用。存的是绝对路径，程序不做拷贝——用户换图只要
     # 改路径，不必先导入一份。
     # 路径失效（文件被删/被挪）**不算配置错误**：背景图是装饰，它失效时程序
@@ -197,6 +203,7 @@ _COERCERS: dict = {
     "model": _coerce_text,
     "timeout": _coerce_timeout,
     "offline_fallback": _coerce_bool,
+    "tray_enabled": _coerce_bool,
     "background_image": _coerce_text,
     "background_blur": _coerce_bool,
     "background_veil": _coerce_veil,

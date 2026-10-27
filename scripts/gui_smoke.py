@@ -285,7 +285,10 @@ EXPECT: dict = {
     "兜底来源提示": (
         lambda v: isinstance(v, str) and "接口请求失败" in v and "离线词库" in v
     ),
-    "兜底来源标签": "来源 本机离线词库",
+    # 离线词条的标签**不是**「来源 X」的句式：它要同时说清「从哪来」和
+    # 「还能更好」——接上接口重查一次，例句与搭配才会出现。
+    "兜底来源标签": "离线待重查",
+    "接口来源标签仍写来源": "来源 接口",
     "兜底后缺项改指重查": lambda v: isinstance(v, str) and "重新查询" in v,
     "非联网时缺项指向设置": lambda v: isinstance(v, str) and "切到接口模式" in v,
     "占位态已清除缺项提示": None,
@@ -325,7 +328,7 @@ EXPECT: dict = {
     "兜底端到端界面提示": (
         lambda v: isinstance(v, str) and "接口请求失败" in v and "离线词库" in v
     ),
-    "兜底端到端来源标签": "来源 本机离线词库",
+    "兜底端到端来源标签": "离线待重查",
     # fallback_reason 刻意不入库，但 source 必须落盘——否则下次打开这条
     # 离线内容就会冒充成接口结果
     "兜底来源已入库": "offline",
@@ -619,6 +622,24 @@ EXPECT: dict = {
     # PDF 需要字体：无字体环境下**拒绝输出**才是正确行为，故两种结局都算通过，
     # 但必须二选一——「既没写出来也没说原因」才是失败
     "PDF 要么落盘、要么明确说明原因": True,
+    # ---- 本轮新增：托盘常驻 / 全局热键 / 离线待重查 / 全量词库 ----
+    # 前两条判的是「没有托盘时不许藏窗口」：读不出来差别的话，用户拿到的是一个
+    # 再也打不开的常驻进程（窗口藏进不存在的托盘，进程还占着数据库）。
+    "没有托盘时不建托盘图标": True,
+    "没有托盘时关闭窗口不收进托盘": True,
+    "有托盘时关闭窗口收进托盘": True,
+    "托盘里的退出是真的退出": True,
+    "设置里关掉托盘后关闭即退出": True,
+    # 预填的是「摸出来的词」，不是整段文字：整句填进去，用户先要删一遍
+    "热键预填把词组填进输入框": "in charge of",
+    "热键预填切到词组收藏": "phrases",
+    "热键不预填整句": "",
+    "托盘开关可用": True,
+    "托盘开关默认勾上": True,
+    "托盘开关如实反映配置": True,
+    # 离线词条说「待重查」，接口词条仍说「来源 接口」——两条成对，
+    # 只测一条的话，把标签写死成「离线待重查」也能通过
+    "接口来源标签仍写来源": "来源 接口",
     # ---- 本轮新增：标签入口与筛选 / 批量查词 / 撤销删除 / 测试连接 / 多文件拖入 ----
     # 这一批的共同点是「接错了也不报错」：标签框改了不落库、筛选下拉列了标签
     # 但点了不过滤、撤销按钮亮着但点了不恢复、拖入多个文件只留第一个。
@@ -956,6 +977,23 @@ def main() -> int:
         _warn = window.detail._warn_label
         results["兜底后缺项改指重查"] = _warn.text() if _warn is not None else "(无提示)"
 
+        # 反向一条：接口来源必须保留「来源 接口」。若把「离线待重查」写成所有
+        # 来源的通用标签，用户会以为自己拿到的接口内容同样残缺——而且界面不报
+        # 任何错，只是那句话在撒谎。上面那两条读的是同一个 `_source_label`
+        # 控件，所以先读再换，顺序反了会把兜底的观测一起冲掉。
+        window.detail.show_entry(
+            _Entry(
+                lemma="apiprobe",
+                definition_en="probe",
+                definition_zh="接口探针",
+                source="openai-compat",
+            )
+        )
+        _api_src = window.detail._source_label
+        results["接口来源标签仍写来源"] = (
+            _api_src.text() if _api_src is not None else "(无标签)"
+        )
+
         # 反向一条：主动选离线模式时，出路必须指回设置——重查还是同一本词典。
         # 不成对断言的话，把文案写死成其中一种也能通过。
         window.detail.set_networked(False)
@@ -1090,6 +1128,18 @@ def main() -> int:
             window,
         )
         results["接口模式兜底开关可用"] = _net_dialog.fallback.isEnabled()
+
+        # 托盘开关。三件事：Windows 上能勾、默认勾上、如实反映配置。
+        # 默认值写反的表现是「用户从没同意过常驻，关掉窗口程序却还在跑」；
+        # 不反映配置的表现是「设置里关掉了，重启又自己勾上」。
+        results["托盘开关可用"] = _net_dialog.tray.isEnabled()
+        results["托盘开关默认勾上"] = _net_dialog.tray.isChecked()
+        _tray_off_dialog = SettingsDialog(
+            {"provider": "mock", "base_url": "", "model": "", "tray_enabled": False},
+            "",
+            window,
+        )
+        results["托盘开关如实反映配置"] = not _tray_off_dialog.tray.isChecked()
 
         # 词库文件不在时，兜底开关必须置灰——`build_provider()` 找不到词库就
         # 直接不挂兜底，留着可勾选等于在界面上撒谎。这条分支在本机不会自然
@@ -3363,6 +3413,67 @@ def main() -> int:
             flush=True,
         )
 
+    def tray_hotkey_check() -> None:
+        """托盘常驻与全局热键（Alt+Q）的界面侧。
+
+        **offscreen 环境没有系统托盘**，真实的 QSystemTrayIcon 建不出来，所以
+        这里不测「托盘图标长什么样」，只测那条能读出差别的判断：
+        **没有托盘时绝不允许把窗口藏起来。**
+
+        这不是形式主义。窗口藏进一个不存在的托盘之后，进程还活着、数据库锁还
+        占着，而桌面上什么都没有；再双击 exe 只会被告知「已在运行」。一个再也
+        打不开的常驻进程，比没有托盘功能糟得多。
+        """
+        # 各阶段各自 import，不用模块级别名：这里的 `mw` 只在本函数作用域内
+        # 存在，漏写一行就是 NameError，而它会把整轮冒烟从这一阶段起全部带走。
+        import app.ui.main_window as mw
+
+        results["没有托盘时不建托盘图标"] = window._tray is None
+        results["没有托盘时关闭窗口不收进托盘"] = window._should_hide_to_tray() is False
+
+        # 有托盘时允许收起来。托盘图标在 offscreen 下造不出来，用一个只提供
+        # `isVisible()` 的最小替身：这条判据读的是我们自己的三条件，而不是托盘
+        # 本身的行为，所以替身不会让它变成恒为真——下面三条反向断言就是证据。
+        class _TrayStub:
+            def isVisible(self) -> bool:  # noqa: N802 - 模仿 Qt 命名
+                return True
+
+        real_tray = window._tray
+        window._tray = _TrayStub()
+        results["有托盘时关闭窗口收进托盘"] = window._should_hide_to_tray() is True
+        window._quitting = True
+        results["托盘里的退出是真的退出"] = window._should_hide_to_tray() is False
+        window._quitting = False
+        window.config["tray_enabled"] = False
+        results["设置里关掉托盘后关闭即退出"] = window._should_hide_to_tray() is False
+        window.config["tray_enabled"] = True
+        window._tray = real_tray
+
+        # 热键预填。剪贴板里的词组要落到词组模式：留在生词本模式的话，回车会把
+        # 它拆成两个词分别去查，而用户想查的是那一条词组。
+        original = QApplication.clipboard().text()
+        window._switch_mode(mw.MODE_WORDS)
+        QApplication.clipboard().setText("in charge of")
+        window._on_hotkey()
+        results["热键预填把词组填进输入框"] = window.input.text()
+        results["热键预填切到词组收藏"] = window._mode
+
+        # 整句不预填：填进去用户先要删一遍，比不填更烦。
+        QApplication.clipboard().setText("She walked into the room slowly")
+        window.input.setText("")
+        window._on_hotkey()
+        results["热键不预填整句"] = window.input.text()
+        QApplication.clipboard().setText(original)
+
+        window.input.clear()
+        window._switch_mode(mw.MODE_WORDS)
+        print(
+            f"  INFO  托盘/热键：收进托盘={results['有托盘时关闭窗口收进托盘']} "
+            f"预填={results['热键预填把词组填进输入框']!r} "
+            f"整句={results['热键不预填整句']!r}",
+            flush=True,
+        )
+
     # 阶段串行的闸门。见 _guard 里的说明——阶段内部会 processEvents()，
     # 那会把**已经到期的定时器**一并派发，于是后一个阶段在前一个阶段内部重入。
     running = {"active": False}
@@ -3438,6 +3549,10 @@ def main() -> int:
     # 这一阶段自己带一个 stub 服务端并真发一次请求，加上几处防抖等待，
     # 整体明显比别的阶段长；导入阶段因此往后让出足够的时间窗。
     QTimer.singleShot(10600, _guard(new_features_check))
+    # 托盘与热键排在 new_features 之后、collocation（14000）之前：它要用同一个
+    # 活着的窗口，而 collocation 会重排列表与模式，放在它后面读到的就不是这里
+    # 造的状态了。闸门会在前一个阶段未结束时重试，不会插队。
+    QTimer.singleShot(11300, _guard(tray_hotkey_check))
     # 排在 new_features 之后：那一阶段自己带一个 stub 服务端、还要等一段多文件
     # 导入，比别的阶段都长。串行闸门会兜住「前一个还没跑完」的情况——这里给的是
     # 一个尽量晚的起点，不等于硬顺序。

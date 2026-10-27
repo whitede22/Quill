@@ -28,6 +28,56 @@ from .ui.theme import stylesheet
 
 LOCK_PATH = APP_DIR / "quill.lock"
 
+# 「把已经开着的那个窗口叫出来」的本地通道名。改名字等于改变协议，
+# 版本号后缀让新旧两版同时存在时不会互相误解。
+ACTIVATION_SERVER = "Quill.Activate.v1"
+
+
+def notify_running_instance(name: str | None = None) -> bool:
+    """让已经运行的实例把窗口叫到前台。成功返回 True。
+
+    **托盘常驻之后，「已经在运行」不再是终点。** 用户双击图标时，窗口多半正
+    藏在托盘里；若只回一句「已在运行」再退出，他看到的是一次毫无反应的双击，
+    而他要的其实只是「把窗口给我」。所以第二个进程先试着敲一下第一个进程，
+    敲通了就安静退出。
+    """
+    if sys.platform != "win32":
+        return False
+    from PySide6.QtNetwork import QLocalSocket
+
+    socket = QLocalSocket()
+    socket.connectToServer(name or ACTIVATION_SERVER)
+    if not socket.waitForConnected(400):
+        return False
+    socket.write(b"show")
+    socket.flush()
+    socket.waitForBytesWritten(400)
+    socket.disconnectFromServer()
+    return True
+
+
+def start_activation_server(on_activate, parent=None, name: str | None = None):
+    """监听唤醒请求。
+
+    **必须给 parent。** QLocalServer 没有父对象又只被局部变量引用时，函数一
+    返回它就被回收，监听跟着消失——「双击图标叫窗口」这条路径于是静默失效，
+    表现是第二个实例又弹「已在运行」。挂到窗口上，窗口活着它就活着。
+
+    `name` 只为测试留出另一个端点：自检要跑真实的监听与敲击，用生产名字会
+    和正在运行的 Quill 抢同一个端点。
+    """
+    from PySide6.QtNetwork import QLocalServer
+
+    endpoint = name or ACTIVATION_SERVER
+    server = QLocalServer(parent)
+    # 上一个进程被强杀时可能留下同名端点，先清掉；不清的话 listen 会失败，
+    # 于是「双击图标叫窗口」这条路径静默失效。
+    QLocalServer.removeServer(endpoint)
+    if not server.listen(endpoint):
+        return None
+    server.newConnection.connect(on_activate)
+    return server
+
 
 def build_service(conn) -> tuple[Repository, DictionaryService]:
     """组装数据层与查词服务（无 GUI 依赖，便于脚本复用与自检）。"""
@@ -107,13 +157,19 @@ def main() -> int:
     if icon_file is not None:
         app.setWindowIcon(QIcon(str(icon_file)))
 
+    # 先敲一下已经开着的那个。敲通了说明它还在跑（很可能正躺在托盘里），
+    # 把它叫出来就够了，这个进程不必再活一份。
+    if notify_running_instance():
+        return 0
+
     lock = acquire_instance_lock()
     if lock is None:
         QMessageBox.information(
             None,
             "Quill 已在运行",
             "生词本已经打开了一个窗口。\n\n"
-            "同时运行多个实例会让数据库写入相互争用，因此只允许开启一个。",
+            "同时运行多个实例会让数据库写入相互争用，因此只允许开启一个。\n"
+            "如果找不到窗口，看一下任务栏右下角的托盘图标。",
         )
         return 0
 
@@ -122,6 +178,8 @@ def main() -> int:
     repo, service = build_service(conn)
 
     window = MainWindow(repo, service, config)
+    # 挂到窗口上：窗口活着，监听就在（见 start_activation_server 的说明）。
+    start_activation_server(window._restore_from_tray, window)
     window.show()
 
     try:

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.models import Entry, Phrase, join_tags
-from ..providers.base import provided_fields, provider_label
+from ..providers.base import provided_fields, source_badge
 from ..providers.prompts import PROMPT_VERSION
 
 
@@ -534,7 +534,8 @@ class EntryDetail(QWidget):
         row.addStretch(1)
 
         if entry.source:
-            source = QLabel(f"来源 {provider_label(entry.source)}")
+            # 离线的说法与其它来源不同，见 base.source_badge 的说明
+            source = QLabel(source_badge(entry.source))
             source.setObjectName("muted")
             row.addWidget(source)
             # 持引用供自检读取：兜底产出的词条必须看得出「不是接口给的」

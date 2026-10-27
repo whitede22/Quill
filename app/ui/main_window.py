@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEventLoop, QSettings, QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QKeySequence, QPainter, QShortcut
+from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -20,10 +20,12 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
     QSplitter,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -65,6 +67,8 @@ from ..providers.base import provided_fields, provider_label, supports_phrases
 from ..security.keystore import load_api_key
 from .background import BackgroundRenderer
 from .export_dialog import EXPORT_FORMATS, ExportDialog, FormatHelpDialog
+from .hotkey import HOTKEY_TEXT, GlobalHotkey, clipboard_seed
+from .hotkey import available as hotkey_available
 from .refresh_dialog import RefreshDialog
 from .review_dialog import ReviewDialog
 from .settings import SettingsDialog
@@ -246,6 +250,16 @@ class MainWindow(QMainWindow):
         self._refresh_cancelled = False
         self._refresh_progress: QProgressDialog | None = None
 
+        # 托盘与全局热键。`_quitting` 区分「关掉窗口」与「真的退出」：
+        # 有托盘时前者只是藏起来（热键才能随时唤出），后者必须真的结束进程。
+        # 没有这个开关，托盘菜单里的「退出」会走同一条 close() 路径，于是
+        # 用户点了退出、窗口消失、进程还在——一个再也打不开的常驻程序。
+        self._quitting = False
+        self._tray: QSystemTrayIcon | None = None
+        self._tray_menu: QMenu | None = None
+        self._hotkey: GlobalHotkey | None = None
+        self._tray_hinted = False
+
         self.setWindowTitle("Quill · 英语生词本")
         self.resize(1080, 700)
         self.setMinimumSize(760, 520)
@@ -265,9 +279,158 @@ class MainWindow(QMainWindow):
         self._restore_state()
         self._wire_signals()
         self._reload_list()
+        # 托盘要在界面搭完之后建：气泡与菜单都要一个活着的窗口做父级。
+        self._setup_tray()
         # 首次启动（或教程升级后）弹出欢迎页。用 singleShot 延后到事件循环：
         # 窗口要先 show() 出来，弹窗才有正确的父级与层级。
         QTimer.singleShot(0, self._maybe_show_onboarding)
+
+    # ---------- 托盘与全局热键 ----------
+
+    def _setup_tray(self) -> None:
+        """建托盘图标并注册全局热键。
+
+        **这里每一道前置检查都是「不满足就干脆不建」，不是「建了再说」。**
+        托盘不存在时把窗口藏起来，用户会以为程序已经退出，而进程还占着数据库
+        锁——下一次双击 exe 得到的是「Quill 已在运行」，且没有任何窗口能操作。
+        所以宁可没有托盘（关闭窗口就真的退出），也不要一个有托盘的半成品。
+        """
+        if not bool(self.config.get("tray_enabled", True)):
+            return
+        if not hotkey_available():
+            return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        tray = QSystemTrayIcon(app.windowIcon(), self)
+        tray.setToolTip(f"Quill · 英语生词本（{HOTKEY_TEXT} 唤出）")
+
+        menu = QMenu(self)
+        act_show = menu.addAction("显示主窗口")
+        act_show.triggered.connect(self._restore_from_tray)
+        menu.addSeparator()
+        act_quit = menu.addAction("退出")
+        act_quit.triggered.connect(self._quit_from_tray)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+
+        self._tray = tray
+        self._tray_menu = menu
+        # 托盘常驻的前提是「最后一个窗口关掉也不退出应用」，否则隐藏窗口会
+        # 连带结束进程，热键随之失效。
+        app.setQuitOnLastWindowClosed(False)
+
+        hotkey = GlobalHotkey(self._on_hotkey, self)
+        self._hotkey = hotkey
+        if not hotkey.register():
+            # 注册失败必须当场说。沉默的表现是「按了没反应」，用户会归咎于
+            # 程序坏了，而不是「这个键被别的软件占了」。
+            self.statusBar().showMessage(
+                f"热键 {HOTKEY_TEXT} 被其他程序占用，已改为只在托盘菜单里操作；"
+                f"关掉占用它的程序后重启本程序即可恢复",
+                10000,
+            )
+
+    def _teardown_tray(self) -> None:
+        """撤掉托盘与热键。重复调用安全。"""
+        if self._hotkey is not None:
+            self._hotkey.unregister()
+            self._hotkey = None
+        if self._tray is not None:
+            self._tray.hide()
+            self._tray.setContextMenu(None)
+            self._tray.deleteLater()
+            self._tray = None
+        self._tray_menu = None
+
+    def _apply_tray_enabled(self) -> None:
+        """设置里改了「托盘常驻」之后就地生效，不用重启程序。"""
+        want = bool(self.config.get("tray_enabled", True))
+        if want and self._tray is None:
+            self._setup_tray()
+        elif not want and self._tray is not None:
+            self._teardown_tray()
+            app = QApplication.instance()
+            if app is not None:
+                app.setQuitOnLastWindowClosed(True)
+
+    def _should_hide_to_tray(self) -> bool:
+        """关窗口时该不该收进托盘，而不是真退出。
+
+        三个条件缺一不可：不是真退出、托盘真的在、配置还开着。
+        """
+        return (
+            not self._quitting
+            and self._tray is not None
+            and self._tray.isVisible()
+            and bool(self.config.get("tray_enabled", True))
+        )
+
+    def _hint_hidden_to_tray(self) -> None:
+        """第一次收进托盘时说一句，之后不再说。
+
+        不说的话，「关窗口没退出」会被理解成关不掉；每次都说的话，就成了
+        每次都要点掉的骚扰。
+        """
+        if self._tray_hinted or self._tray is None:
+            return
+        self._tray_hinted = True
+        self._tray.showMessage(
+            "Quill 还在后台运行",
+            f"按 {HOTKEY_TEXT} 随时唤出；不想要托盘的话，在设置里关掉「托盘常驻」。",
+            QSystemTrayIcon.MessageIcon.Information,
+            6000,
+        )
+
+    def _restore_from_tray(self) -> None:
+        """把窗口从托盘 / 最小化状态提到前台。"""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason) -> None:
+        # 单击与双击都还原窗口。只认双击的话，不少用户（尤其是第一次用托盘
+        # 图标的人）会点一下就觉得「没反应」。
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_from_tray()
+
+    def _quit_from_tray(self) -> None:
+        """托盘菜单里的「退出」：真的结束进程。"""
+        self._quitting = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _on_hotkey(self) -> None:
+        """热键触发：窗口提到前台，剪贴板里的词预填进输入框。
+
+        预填的东西决定落到哪个集合：2 个词以上只可能是词组（导入侧同一条判据），
+        留在生词本模式的话回车会把它拆成两个词分别去查。
+        """
+        self._restore_from_tray()
+        seed = clipboard_seed(QApplication.clipboard().text())
+        if not seed:
+            self.input.setFocus()
+            self.input.selectAll()
+            self.statusBar().showMessage(
+                f"剪贴板里没有可查的词。窗口已就绪，直接输入即可（{HOTKEY_TEXT} 随时唤出）",
+                4000,
+            )
+            return
+        target = MODE_PHRASES if len(seed.split()) >= 2 else MODE_WORDS
+        if self._mode != target:
+            self._switch_mode(target)
+        self.input.setText(seed)
+        self.input.selectAll()
+        self.input.setFocus()
 
     def _maybe_show_onboarding(self) -> None:
         """教程版本号落后于当前版本时，弹出欢迎页并写回新版本。
@@ -1052,6 +1215,16 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         self._flush_edits()
         self._save_state()
+        # 有托盘时，「关窗口」只是收起来。这一步必须排在下面那些取消动作**之前**：
+        # 收进托盘之后导入、重查都还在跑，把它们取消掉属于另一个 bug。
+        if self._should_hide_to_tray():
+            event.ignore()
+            self.hide()
+            self._hint_hidden_to_tray()
+            return
+        # 真的退出：先撤托盘与热键。热键是系统级独占资源，进程走了却没撤，
+        # 下一次启动会注册失败，而用户看到的只是「热键突然不好使了」。
+        self._teardown_tray()
         # 导入 / 重查正跑到一半被关窗口：进度框是 `self` 的 WindowModal 子窗口，
         # 父窗口关掉之后它可能留在屏幕上——而到那时已经没有任何东西能把它的状态
         # 收回来，用户看到的就是一个「关不掉的 100%」。先取消，再把框撤掉。
@@ -2445,6 +2618,8 @@ class MainWindow(QMainWindow):
         if image:
             self._remember_background(image)
         save_config(self.config)
+        # 托盘开关就地生效：改完还要重启程序才生效的开关，用户会以为它坏了。
+        self._apply_tray_enabled()
         self.service.set_provider(build_provider(self.config, load_api_key(KEY_PATH)))
         # 详情面板的「出路」文案取决于是否联网，切模式后必须同步，
         # 否则会沿用上一次的说法（离线内容让你去切接口模式，而你现在就在接口模式）

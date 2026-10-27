@@ -1657,6 +1657,59 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         "scripts/gui_smoke.py",
         "单词表每行最多两列",
     ),
+    #
+    # 托盘 / 全局热键 / 离线待重查。这三块的共同失败形态是「什么都没发生，
+    # 也不报错」：热键没注册上表现为按了没反应，窗口藏进不存在的托盘表现为
+    # 进程还在但打不开，标签写错表现为用户不知道该重查。
+    (
+        # 去掉词数上限：整句会被原样填进输入框。用户从网页上复制一句话，
+        # 按 Alt+Q 得到一句英文，得先删一遍才能查——比不预填更烦，而界面
+        # 没有任何地方会说「这里不该填整句」。
+        "hotkey.py 剪贴板预填不设词数上限（整句也填进去）",
+        "app/ui/hotkey.py",
+        "    if not 1 <= len(words) <= MAX_WORDS_PER_PHRASE:\n        return \"\"\n",
+        "    if not words:\n        return \"\"\n",
+        "scripts/selfcheck.py",
+        "剪贴板预填只收词与词组",
+    ),
+    (
+        # 热键预填一律落生词本：剪贴板里是 `in charge of` 时，回车会把它拆成
+        # in / charge / of 三个词分别去查，而用户要查的是那一条词组。
+        "main_window 热键预填不按词数切到词组模式（词组被拆成单词）",
+        "app/ui/main_window.py",
+        "        target = MODE_PHRASES if len(seed.split()) >= 2 else MODE_WORDS\n",
+        "        target = MODE_WORDS\n",
+        "scripts/gui_smoke.py",
+        "热键预填切到词组收藏",
+    ),
+    (
+        # 不再检查托盘是否存在：窗口被 hide() 进一个不存在的托盘。进程还活着、
+        # 数据库锁还占着，而桌面上什么都没有——再双击 exe 只会被告知「已在运行」。
+        "main_window 没有托盘也把窗口收起来（窗口再也打不开）",
+        "app/ui/main_window.py",
+        "        return (\n"
+        "            not self._quitting\n"
+        "            and self._tray is not None\n"
+        "            and self._tray.isVisible()\n"
+        "            and bool(self.config.get(\"tray_enabled\", True))\n"
+        "        )\n",
+        "        return (\n"
+        "            not self._quitting\n"
+        "            and bool(self.config.get(\"tray_enabled\", True))\n"
+        "        )\n",
+        "scripts/gui_smoke.py",
+        "没有托盘时关闭窗口不收进托盘",
+    ),
+    (
+        # 离线词条也戴上「来源」前缀：那句话变成「来源 本机离线词库」，
+        # 用户看不出这条还能靠接口变好，而界面照常显示、不报错。
+        "base.py 离线标签也写成「来源 X」（不再提示待重查）",
+        "app/providers/base.py",
+        '    if key == "offline":\n        return "离线待重查"\n',
+        '    if key == "offline":\n        return f"来源 {provider_label(source)}"\n',
+        "scripts/selfcheck.py",
+        "离线词条标签写「离线待重查」",
+    ),
 ]
 
 
