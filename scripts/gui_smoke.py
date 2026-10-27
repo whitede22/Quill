@@ -797,6 +797,9 @@ EXPECT: dict = {
     # ③c 的「词组模式下单词被拒绝并指路」取代（词组模式只查词组，单词当场
     # 拒绝并指向生词本，不再静默切集合替用户查），这里遂改为守住留下那一半。
     "生词本模式查词照常落库": True,
+    # 查词结果属于生词本。响应回来时用户已经切到词组收藏了，就必须把集合切回去；
+    # 否则右边渲染着刚查到的词、左栏一条都不选中，而状态栏照说「已收录」。
+    "查词途中切到词组收藏，结果回来时自动切回生词本": "words",
     # 欢迎页 / 教程（welcome_check）。
     "欢迎弹窗标题": "欢迎来到 Quill",
     "欢迎弹窗署名": "made by wtd22",
@@ -3276,6 +3279,35 @@ def main() -> int:
             if shown is not None and shown.lemma == "meticulous":
                 break
         results["生词本模式查词照常落库"] = repo.get("meticulous") is not None
+
+        # ---------- ⑦b 查词在路上时切到词组收藏：结果回来要把集合切回去 ----------
+        # 保护是 `_present_entry()` 开头那句「查词结果属于生词本，先切回去」。
+        # 触发它的路径**不再是**「在词组模式输入单词」（那个现在当场被拒绝），
+        # 而是竞态：在生词本里查一个词、响应还没回来就点「词组收藏」。
+        # 少了这句，右边渲染着刚查到的词、左栏列的全是词组、一条都不选中——
+        # 而状态栏说「已收录」，用户以为自己的词丢了。
+        #
+        # 这条同时替掉了一条已经失去视野的旧断言：`_do_lookup` 在词组模式下
+        # 不再走单词查询以后，原来那个「在词组模式查词会自动切回生词本」的入口
+        # 就没有了，变异检测随即报 MISSED（保护还在，判据看不见它）。
+        #
+        # 词用 `meticulous`（MockProvider 的示例词，刚查过所以走缓存，不会有网络
+        # 往返）：这里要证的是「回调回来时集合被切回去」，与查到了什么无关。
+        # 等待条件读 `_mode` 而**不是**详情区——详情区上一步就已经是这个词了，
+        # 拿它当条件会在回调到达之前就跳出循环，断言随即读到「还是词组模式」。
+        window._switch_mode(mw.MODE_WORDS)
+        window.input.setText("meticulous")
+        mw.QMessageBox = _YesBox
+        try:
+            window._lookup_word("meticulous")  # 只管发出去，不等回调
+            window._switch_mode(mw.MODE_PHRASES)  # 同一轮栈里切走，先于回调到达
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and window._mode != mw.MODE_WORDS:
+                app.processEvents()
+                time.sleep(0.01)
+        finally:
+            mw.QMessageBox = real_box
+        results["查词途中切到词组收藏，结果回来时自动切回生词本"] = window._mode
 
         # 收尾：回到生词本，清掉搜索框，免得影响后面的导入阶段。
         window.filter.clear()
