@@ -1624,6 +1624,39 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         "scripts/selfcheck.py",
         "词组：单个词在词组模式下被拒绝并指路",
     ),
+    # ---- 单词表导出（v1.1.1）----
+    #
+    # 这份格式的全部价值就是「导出去还能原样导回来」。它出错的方式只有一种：
+    # 多写了一点东西进去。而多写的那点东西在界面上完全看不出来——文件照样
+    # 生成、照样能打开，只有导入报告里会多几行。
+    (
+        # 把标题写进第一行：导入侧会把「英语生词本」判成一行废行，报告里出现
+        # 「没认出单词：英语生词本」。用户不会想到这是导出时加的标题。
+        "exporter.py 单词表把标题写进第一行（导入时多一行废行）",
+        "app/core/exporter.py",
+        "    lines: list[str] = []\n"
+        "    for entry in entries:\n"
+        "        lemma = _flatten(entry.lemma)\n",
+        "    lines: list[str] = [title]  # 变异：标题写进第一行\n"
+        "    for entry in entries:\n"
+        "        lemma = _flatten(entry.lemma)\n",
+        "scripts/selfcheck.py",
+        "导入：单词表导出没有任何一行被当成跳过",
+    ),
+    (
+        # 多塞一列：界面上仍然叫「单词表」，文件里却成了三列。
+        #
+        # 这一列刻意取**恒有值**的序号，而不是音标/英文释义——那几个字段在
+        # 界面那条路的库里不一定有值，变异就会与原实现逐字节相同，被记成
+        # MISSED，读起来像「这条保护形同虚设」。
+        "exporter.py 单词表多写一列（不再是两列）",
+        "app/core/exporter.py",
+        '        lines.append(f"{lemma}{WORDLIST_SEP}{gloss}" if gloss else lemma)\n',
+        '        row = f"{lemma}{WORDLIST_SEP}{gloss}" if gloss else lemma\n'
+        '        lines.append(row + WORDLIST_SEP + "1")  # 变异：多一列序号\n',
+        "scripts/gui_smoke.py",
+        "单词表每行最多两列",
+    ),
 ]
 
 
