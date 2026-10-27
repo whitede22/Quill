@@ -253,6 +253,60 @@ def sentence_uses(sentence: str, word: str) -> bool:
     return any(token.startswith(prefix) for token in tokens)
 
 
+# 派生形态的「替身条目」在中文释义里会自报家门：`（run的复数形式）`。
+# 这七个说法就是判据本身，散在 SQL 里以后加一种就没法整体核对。
+_INFLECTION_MARKS = (
+    "复数形式",
+    "过去式",
+    "过去分词",
+    "现在分词",
+    "第三人称单数",
+    "比较级",
+    "最高级",
+)
+
+
+def drop_inflection_stubs(dst: sqlite3.Connection) -> int:
+    """删掉「自称是某词变形」的替身条目，返回删除条数。
+
+    ## 为什么必须删
+
+    ECDICT 给大量屈折形态单独建了条目，释义只有一句 `（run的复数形式）`。
+    `dict` 表的精确匹配优先于 `forms` 的形态还原，于是查 `runs` 命中的是那条
+    替身——`n. 顺串；泻肚子；流量（run的复数形式）`——而不是 `run` 的完整释义。
+    精简档里没有这个问题（那些词不在考试词表里），换到全量档才浮出来。
+
+    ## 判据为什么是那句中文
+
+    三个看着更「结构化」的特征都不能用：
+
+    - **无音标**：`acclaimed` 有音标、`abnormalities` 也有，按它筛会漏；
+      反过来只按「是别人的形态且无音标」筛会误删三万多条真词。
+    - **有英文释义**：有，而且是 `imp. & p. p. of Act` 这种，本身不干净。
+    - **词长**：与是不是替身无关。
+
+    只有那句中文是条目自己承认的身份。实测命中 1,176 条，其中 1,036 条无音标。
+
+    ## 删掉之后还查得到吗
+
+    查得到。`forms` 里的 `runs -> run` 仍在，查词会落到原形；「精确匹配优先」
+    那条不变量也不受影响——`running` 自己带音标与释义，压根不在删除范围内。
+    """
+    marks = " OR ".join("d.translation LIKE ?" for _ in _INFLECTION_MARKS)
+    params = [f"%{mark}）%" for mark in _INFLECTION_MARKS]
+    # rowcount 在游标上，不在连接上（连接对象根本没有这个属性，写错会在临门一脚
+    # 处抛 AttributeError——数据已经删好、只差提交，文件却是半成品）
+    cursor = dst.execute(
+        "DELETE FROM dict WHERE word IN ("
+        "  SELECT d.word FROM dict d"
+        "  JOIN forms f ON f.form = d.word AND f.word <> d.word"
+        f"  WHERE ({marks})"
+        ")",
+        params,
+    )
+    return max(cursor.rowcount, 0)
+
+
 def build(
     source: Path,
     examples: Path | None,
@@ -404,6 +458,9 @@ def build(
     except sqlite3.Error:
         pass  # 源库没有该表时静默跳过：形态索引的完整性不依赖它
 
+    # 删除替身必须排在形态表之后：判据要 join `forms` 才知道某条是不是别人的变形。
+    stubs_dropped = drop_inflection_stubs(dst)
+
     meta = {
         "schema_version": str(OFFLINE_SCHEMA_VERSION),
         "built_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -420,6 +477,7 @@ def build(
             "word_count": str(word_count),
             "form_count": str(form_count),
             "example_count": str(example_count),
+            "inflection_stubs_dropped": str(stubs_dropped),
         }
     )
     dst.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", meta.items())
@@ -475,6 +533,11 @@ def build(
     print(f"  词条         {word_count:,}")
     print(f"  屈折形态     {form_count:,}")
     print(f"  例句         {example_count:,}")
+    if stubs_dropped:
+        print(
+            f"  （另有 {stubs_dropped:,} 条「某词的复数/过去式」替身条目已删除："
+            "留着会让查 runs 命中它自己那条薄释义，而不是 run）"
+        )
     if sentence_skipped:
         print(
             f"  （另有 {sentence_skipped:,} 条例句与词不匹配，已丢弃：源语料约 9% 的配对有误）"

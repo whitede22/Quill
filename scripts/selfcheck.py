@@ -4987,6 +4987,132 @@ def main() -> int:
         f"interval={_restored_row.review_interval} count={_restored_row.review_count}",
     )
 
+    # ---- 托盘 / 全局热键 / 离线待重查 ----
+    # 这三块都有一模一样的失败形态：**什么都没发生，也不报错**。
+    # 热键没注册上表现为「按了没反应」，托盘没建起来表现为「关掉窗口进程还在」，
+    # 标签写错表现为「用户不知道该重查」。所以判据必须打在能读出差别的观测上。
+    try:
+        from app.providers.base import source_badge
+        from app.ui import hotkey as hotkey_mod
+
+        check(
+            "离线词条标签写「离线待重查」",
+            source_badge("offline") == "离线待重查",
+            repr(source_badge("offline")),
+        )
+        # 非离线来源**必须**保留「来源」前缀：把接口结果也写成一句「待重查」，
+        # 用户会以为自己拿到的内容跟离线一样残缺。
+        check(
+            "接口词条标签仍写来源",
+            source_badge("openai-compat") == "来源 接口",
+            repr(source_badge("openai-compat")),
+        )
+        # 大小写与空白不该改变判定：库里的 source 来自配置与常量，写法不统一时
+        # 上面那条就会悄悄失效（标签变回「来源 本机离线词库」而不报错）。
+        check(
+            "标签判定不区分来源大小写",
+            source_badge("  Offline ") == "离线待重查",
+            repr(source_badge("  Offline ")),
+        )
+
+        # 组合键只有一份定义：显示文字、虚拟键码、修饰键三者必须互相吻合。
+        # 分开写两个常量时，改了显示而忘了注册，用户会按一个从没被注册的键。
+        check(
+            "热键显示文字与注册的键码一致",
+            hotkey_mod.HOTKEY_TEXT == "Alt+Q"
+            and hotkey_mod._VK == ord("Q")
+            and hotkey_mod._MODS & hotkey_mod.MOD_ALT
+            and not hotkey_mod._MODS & 0x0002,  # 不许混进 Ctrl
+            f"{hotkey_mod.HOTKEY_TEXT} VK={hotkey_mod._VK:#x} MODS={hotkey_mod._MODS:#x}",
+        )
+
+        _seeds = {
+            "ubiquitous": "ubiquitous",
+            "  meticulous  ": "meticulous",
+            '"take off"': "take off",
+            "in charge of": "in charge of",
+            # 整句：4 词以上不预填。填进去用户先要删一遍，比不填更烦。
+            "She walked into the room slowly": "",
+            "as a matter of fact": "",
+            # 含数字/标点：不是词条
+            "3 apples": "",
+            "e.g.": "",
+            "": "",
+        }
+        _bad_seed = {
+            k: hotkey_mod.clipboard_seed(k)
+            for k, want in _seeds.items()
+            if hotkey_mod.clipboard_seed(k) != want
+        }
+        check("剪贴板预填只收词与词组", not _bad_seed, str(_bad_seed) or "全部符合预期")
+        check(
+            "剪贴板多行只取第一行有内容的",
+            hotkey_mod.clipboard_seed("\n\n  meticulous \n第二行不算") == "meticulous",
+            repr(hotkey_mod.clipboard_seed("\n\n  meticulous \n第二行不算")),
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("离线词条标签写「离线待重查」", False, str(exc))
+        check("接口词条标签仍写来源", False, "前置步骤失败")
+        check("标签判定不区分来源大小写", False, "前置步骤失败")
+        check("热键显示文字与注册的键码一致", False, "前置步骤失败")
+        check("剪贴板预填只收词与词组", False, "前置步骤失败")
+        check("剪贴板多行只取第一行有内容的", False, "前置步骤失败")
+
+    # 托盘开关必须能随配置保存。它挂在 _COERCERS 之外时不会报错，只会表现成
+    # 「设置里关掉托盘、重启后窗口又藏进托盘」——开关形同虚设。
+    try:
+        import app.config as _cfg_mod
+
+        _saved_paths = (_cfg_mod.APP_DIR, _cfg_mod.CONFIG_PATH)
+        _tray_dir = tmpdir / "tray_cfg"
+        _tray_dir.mkdir(parents=True, exist_ok=True)
+        _cfg_mod.APP_DIR = _tray_dir
+        _cfg_mod.CONFIG_PATH = _tray_dir / "config.json"
+        try:
+            _cfg_mod.save_config({"tray_enabled": False})
+            _off_ok = _cfg_mod.load_config()["tray_enabled"] is False
+            _cfg_mod.save_config({"tray_enabled": True})
+            _on_ok = _cfg_mod.load_config()["tray_enabled"] is True
+        finally:
+            _cfg_mod.APP_DIR, _cfg_mod.CONFIG_PATH = _saved_paths
+        check("托盘开关可保存且能关掉", _off_ok and _on_ok, f"关={_off_ok} 开={_on_ok}")
+    except Exception as exc:  # noqa: BLE001
+        check("托盘开关可保存且能关掉", False, str(exc))
+
+    # 单实例唤醒通道。托盘常驻之后窗口可能藏在托盘里，第二个进程必须能把它
+    # 叫出来；这条通道要是坏了，双击图标只会得到一句「已在运行」然后什么都不
+    # 发生，而进程还在后台占着数据库。
+    try:
+        import app.main as _main_mod
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtNetwork import QLocalServer
+
+        _probe_name = "Quill.Selfcheck.Activate"
+        # 用 QCoreApplication 而不是 QApplication：这条链路只要事件分发，
+        # 不需要窗口系统。建 QApplication 会在无显示环境里要求平台插件，
+        # 把一条「通道通不通」的判据变成「这台机器有没有桌面」。
+        _qapp = QCoreApplication.instance() or QCoreApplication([])
+        _hits: list[int] = []
+        _srv = _main_mod.start_activation_server(
+            lambda: _hits.append(1), None, _probe_name
+        )
+        _listen_ok = _srv is not None
+        _knock = _main_mod.notify_running_instance(_probe_name) if _listen_ok else False
+        _deadline = time.monotonic() + 3.0
+        while not _hits and time.monotonic() < _deadline:
+            _qapp.processEvents()
+            time.sleep(0.01)
+        if _srv is not None:
+            _srv.close()
+        QLocalServer.removeServer(_probe_name)
+        check(
+            "单实例唤醒通道可用",
+            _listen_ok and _knock and bool(_hits),
+            f"监听={_listen_ok} 敲通={_knock} 回调={len(_hits)} 次",
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("单实例唤醒通道可用", False, str(exc))
+
     conn.close()
 
     print("=" * 56)

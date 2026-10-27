@@ -69,7 +69,12 @@ EXCLUDED_MODULES = [
     "PySide6.QtPdfWidgets",
     "PySide6.QtSvg",
     "PySide6.QtSvgWidgets",
-    "PySide6.QtNetwork",
+    # QtNetwork 不能排除：单实例唤醒走 QLocalServer / QLocalSocket（见
+    # app/main.py 的 notify_running_instance）。托盘常驻之后窗口可能藏在托盘里，
+    # 用户再双击图标时需要由第二个进程把第一个叫到前台——没有这条通道，
+    # 双击只会得到一句「已在运行」然后什么都不发生。
+    # 底层的 qt6network.dll 本来就在保留清单里（generic 触摸插件依赖它），
+    # 这里放开的只是 Python 绑定。
     "PySide6.QtRemoteObjects",
     "PySide6.QtScxml",
     "PySide6.QtStateMachine",

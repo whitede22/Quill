@@ -675,6 +675,41 @@ def run_selfcheck() -> int:
     except Exception as exc:  # noqa: BLE001
         note("词组收藏表独立且幂等", False, str(exc))
 
+    # 23. 全量词库必须真的随包分发。裁剪成精选档时程序照常能查，只是「查不到
+    #     的生僻词」多得多——不报错、不提示，用户只会以为这本词典就这个水平。
+    try:
+        import sqlite3 as _sqlite
+
+        from app.providers.offline import resolve_offline_dict
+
+        _dict_path = resolve_offline_dict()
+        _meta: dict = {}
+        if _dict_path is not None:
+            _dconn = _sqlite.connect(f"file:{_dict_path.as_posix()}?mode=ro", uri=True)
+            try:
+                _meta = {r[0]: r[1] for r in _dconn.execute("SELECT key, value FROM meta")}
+            finally:
+                _dconn.close()
+        _tier = str(_meta.get("tier") or "")
+        _words = int(_meta.get("word_count") or 0)
+        note(
+            "全量词库随包分发",
+            _tier == "full" and _words >= 700000,
+            f"{_tier or '缺失'} · {_words:,} 词",
+        )
+    except Exception as exc:  # noqa: BLE001
+        note("全量词库随包分发", False, str(exc))
+
+    # 24. QtNetwork 的 Python 绑定。单实例唤醒（把藏在托盘里的窗口叫出来）走
+    #     QLocalServer，而 spec 曾经把整个 QtNetwork 模块排除掉——源码运行一切
+    #     正常，打包后却 import 失败，表现是「双击图标没反应，只弹一句已在运行」。
+    try:
+        from PySide6.QtNetwork import QLocalServer  # noqa: F401
+
+        note("QtNetwork 绑定可用", True)
+    except Exception as exc:  # noqa: BLE001
+        note("QtNetwork 绑定可用", False, str(exc))
+
     summary = f"自检结果：{len(lines) - failed} 项通过，{failed} 项失败"
     lines.append("")
     lines.append(summary)

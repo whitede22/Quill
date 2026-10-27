@@ -26,6 +26,8 @@ from ..providers import offline_dict_status, resolve_offline_dict
 from ..providers.openai_compat import OpenAICompatProvider
 from ..security.keystore import IS_WINDOWS, save_api_key
 from .background import BackgroundRenderer
+from .hotkey import HOTKEY_TEXT
+from .hotkey import available as hotkey_available
 from .theme import (
     BG_VEIL_DEFAULT,
     THEME_DEFAULT,
@@ -142,6 +144,24 @@ class SettingsDialog(QDialog):
             "兜底内容会在详情里标明来自离线词库，不会冒充接口结果。"
         )
 
+        # 托盘自选。热键的价值在「窗口没开着的时候按一下」，所以默认开启；
+        # 但「关掉窗口程序还在跑」必须由用户自己同意，设置里能关。
+        # 非 Windows 平台没有全局热键，开关置灰并说明原因——留一个点了没反应的
+        # 勾选框，比没有这个勾选框更让人困惑。
+        self.tray = QCheckBox(f"关闭窗口后留在托盘，按 {HOTKEY_TEXT} 随时唤出")
+        self.tray.setChecked(bool(config.get("tray_enabled", True)))
+        if hotkey_available():
+            self.tray.setToolTip(
+                f"开启后关闭窗口只是收进托盘，{HOTKEY_TEXT} 能把窗口叫回来，"
+                "输入框里会自动填好剪贴板里的那个词。\n"
+                "想彻底退出，用托盘菜单里的「退出」。"
+            )
+        else:
+            self.tray.setChecked(False)
+            self.tray.setEnabled(False)
+            self.tray.setText("关闭窗口后留在托盘（仅 Windows 支持全局热键）")
+            self.tray.setToolTip("当前平台没有系统级热键，关闭窗口即退出程序。")
+
         # 离线词库的规模直接摆在设置里：用户要先知道「本地这本词典有多少词」，
         # 才能判断该不该切过去，而不是切过去发现查不到再生疑。
         offline = resolve_offline_dict()
@@ -189,6 +209,7 @@ class SettingsDialog(QDialog):
         layout.setSpacing(12)
         layout.addLayout(form)
         layout.addWidget(self.fallback)
+        layout.addWidget(self.tray)
         layout.addWidget(hint)
         layout.addWidget(offline_hint)
         layout.addWidget(storage)
@@ -545,6 +566,7 @@ class SettingsDialog(QDialog):
         self._config["base_url"] = self.base_url.text().strip()
         self._config["model"] = self.model.text().strip()
         self._config["offline_fallback"] = self.fallback.isChecked()
+        self._config["tray_enabled"] = self.tray.isChecked()
         self._config["background_image"] = self.background.text().strip()
         self._config["background_blur"] = self.bg_blur.isChecked()
         self._config["background_veil"] = self.bg_veil.currentData() or BG_VEIL_DEFAULT
