@@ -40,9 +40,11 @@ from app.core.db import (  # noqa: E402
     SCHEMA_VERSION,
     backup_to,
     connect,
+    fts_in_sync,
     fts_values,
     init_db,
     inspect_backup,
+    rebuild_fts,
     replace_with_staged,
     stage_restore,
     to_bigram,
@@ -1045,14 +1047,157 @@ def main() -> int:
         old.execute("SELECT COUNT(*) AS c FROM entries_fts").fetchone()["c"] == 1,
     )
     old.close()
-    # 结构已正确的库再次 init_db 不应触发重建（重建无必要，且会白跑一遍全量索引）
+    # 结构已正确的库再次 init_db 不应触发重建（重建无必要，且会白跑一遍全量索引）。
+    # 判据不能是「条数仍为 1」：重建与否都是 1，那是一条恒为真的断言。改成先在
+    # 索引里留一个篡改痕迹，只有「真的没重建」它才会留下。
     reopened = connect(old_dir / "old.db")
+    reopened.execute("UPDATE entries_fts SET lemma = 'leftover_mark' WHERE rowid = 1")
+    reopened.commit()
     init_db(reopened)
     check(
         "结构正确时不重建索引",
-        reopened.execute("SELECT COUNT(*) AS c FROM entries_fts").fetchone()["c"] == 1,
+        reopened.execute(
+            "SELECT COUNT(*) AS c FROM entries_fts WHERE lemma = 'leftover_mark'"
+        ).fetchone()["c"]
+        == 1,
+        "索引被重建了，篡改痕迹消失",
     )
     reopened.close()
+
+    # ---- 8b. 索引与主表的条数一致性 ----
+    #
+    # 索引靠仓储手工同步，没有一个数据库层的兜底。它坏掉时最阴险的形态不是
+    # 「全空」而是「缺几条」：`search()` 在 FTS 结果为空时会回退 LIKE，所以全空
+    # 反而还能搜到（只是慢、且从 BM25 排序退化成按创建时间倒序）；而缺一条时
+    # FTS 返回的结果非空，回退不触发，那一条就永远不出现，也不报错。
+    #
+    # 因此判据必须打在「召回条数」上，不能打在「有没有结果」上。若写成
+    # 「删一行后还能搜到某词」，修复前也会通过——LIKE 兜底替它答了。
+    desync = connect(old_dir / "desync.db")
+    init_db(desync)
+    desync_repo = Repository(desync)
+    for _name in ("alpha_one", "beta_one", "gamma_one"):
+        desync_repo.upsert(Entry(lemma=_name, definition_zh="共同释义文本", definition_en=_name))
+    desync.execute("DELETE FROM entries_fts WHERE rowid = 2")
+    desync.commit()
+    check("人为删掉一行索引后判定不同步", not fts_in_sync(desync))
+
+    hit_before = {e.lemma for e in desync_repo.search("共同释义")}
+    check(
+        "索引缺一行时召回不全",
+        hit_before == {"alpha_one", "gamma_one"},
+        str(sorted(hit_before)),
+    )
+    init_db(desync)
+    check("条数不符时自动重建索引", fts_in_sync(desync))
+    hit_after = {e.lemma for e in desync_repo.search("共同释义")}
+    check(
+        "自动重建后缺的那条回来",
+        hit_after == {"alpha_one", "beta_one", "gamma_one"},
+        str(sorted(hit_after)),
+    )
+
+    # ---- 8c. 重建中途失败必须整体回滚 ----
+    #
+    # DROP 与 CREATE 若各自提交，失败后库里既没有旧索引也没有新索引；而
+    # `has_fts` 只认表名，下次启动会当成一切正常。判据打在「行数与故障前相等」上：
+    # 只要事务没包住，DROP 已提交，行数必然是 0。
+    #
+    # 这一段**自己建库造状态**，不沿用 8b 留下的索引。第一版是接在 8b 后面跑的，
+    # 结果 8b 一旦被变异打掉（不再自动重建），本段的前置条件就跟着消失，
+    # 「抛异常」那条永远等不到，而回滚那两条变成空转通过。
+    from app.core import db as _db_module
+
+    def _raise_midway(_entry):
+        raise RuntimeError("模拟重建中途失败")
+
+    rollback_db = connect(old_dir / "rollback.db")
+    init_db(rollback_db)
+    rollback_repo = Repository(rollback_db)
+    for _name in ("rb_one", "rb_two"):
+        rollback_repo.upsert(Entry(lemma=_name, definition_zh="回滚测试释义"))
+    rollback_db.execute("DELETE FROM entries_fts WHERE rowid = 1")
+    rollback_db.commit()
+    before_fail_rows = rollback_db.execute(
+        "SELECT count(*) AS c FROM entries_fts"
+    ).fetchone()["c"]
+    check(
+        "故障注入前索引处于不同步状态",
+        before_fail_rows == 1 and not fts_in_sync(rollback_db),
+        f"索引 {before_fail_rows} 行，词条 {rollback_repo.count()} 条",
+    )
+
+    _orig_fts_values = _db_module.fts_values
+    _db_module.fts_values = _raise_midway
+    try:
+        init_db(rollback_db)
+    except RuntimeError:
+        check("重建中途失败时 init_db 抛出异常", True)
+    else:
+        check("重建中途失败时 init_db 抛出异常", False, "没有抛出，异常被吞了")
+    finally:
+        _db_module.fts_values = _orig_fts_values
+
+    fail_rows = rollback_db.execute("SELECT count(*) AS c FROM entries_fts").fetchone()["c"]
+    check(
+        "重建失败后索引回到故障前状态",
+        fail_rows == before_fail_rows,
+        f"{fail_rows} != {before_fail_rows}（0 表示 DROP 已被提交）",
+    )
+    check("重建失败后连接已回滚", not rollback_db.in_transaction)
+    check(
+        "重建失败后索引表仍在",
+        rollback_db.execute(
+            "SELECT count(*) AS c FROM sqlite_master WHERE type='table' AND name='entries_fts'"
+        ).fetchone()["c"]
+        == 1,
+    )
+    rollback_db.close()
+    desync.close()
+
+    # ---- 8d. 条数一致时不重建 ----
+    #
+    # 一致性检查是**条数级**的，不是逐行比对。这条断言把这个边界钉住：篡改索引
+    # 内容但不改条数，init_db 不得因此白跑一遍全量重建；同时也提醒后来的人，
+    # 别以为这条检查能发现「内容陈旧」。
+    tamper = connect(old_dir / "tamper.db")
+    init_db(tamper)
+    tamper_repo = Repository(tamper)
+    tamper_repo.upsert(Entry(lemma="legacy_two", definition_zh="旧释义", definition_en="old"))
+    tamper.execute("UPDATE entries_fts SET lemma = 'tamperedlemma' WHERE rowid = 1")
+    tamper.commit()
+    init_db(tamper)
+    check(
+        "条数一致时不因内容差异重建",
+        tamper.execute(
+            "SELECT count(*) AS c FROM entries_fts WHERE lemma = 'tamperedlemma'"
+        ).fetchone()["c"]
+        == 1,
+        "索引被重建了，说明检查做成了逐行比对",
+    )
+    tamper.close()
+
+    # ---- 8e. 用户可点的重建入口 ----
+    #
+    # 界面上的按钮走同一个函数，但不经过 init_db 的事务。这里验证它自己提交：
+    # 调用后关掉连接重开，重建结果必须还在。
+    manual = connect(old_dir / "manual.db")
+    init_db(manual)
+    manual_repo = Repository(manual)
+    manual_repo.upsert(Entry(lemma="manual_word", definition_zh="手工重建", definition_en="manual"))
+    manual.execute("DELETE FROM entries_fts WHERE rowid = 1")
+    manual.commit()
+    manual_rows = rebuild_fts(manual)
+    manual.commit()
+    check("手工重建返回的条数等于词条数", manual_rows == 1, str(manual_rows))
+    manual.close()
+    manual_reopen = connect(old_dir / "manual.db")
+    check(
+        "手工重建的结果已提交",
+        manual_reopen.execute("SELECT count(*) AS c FROM entries_fts").fetchone()["c"] == 1,
+    )
+    check("手工重建后判定同步", fts_in_sync(manual_reopen))
+    manual_reopen.close()
 
     # ---- 9. 词形还原候选 ----
     check("还原 -ing 双写", "run" in lemma_candidates("running"), str(lemma_candidates("running")))

@@ -233,11 +233,38 @@ def fts_columns_present(conn: sqlite3.Connection) -> tuple[str, ...]:
     return tuple(row["name"] for row in conn.execute("PRAGMA table_info(entries_fts)"))
 
 
-def _rebuild_fts(conn: sqlite3.Connection) -> None:
-    """按 entries 重建全文索引。
+def fts_in_sync(conn: sqlite3.Connection) -> bool:
+    """索引条数与词条条数是否一致。用于启动时发现「索引在但内容不全」。
+
+    查的是**条数**，不是内容。这个边界必须写清楚：它能发现「DROP 之后没建完」
+    「索引里多出已删词条的残留」这类结构性缺失，发现不了「索引完好但某行内容
+    陈旧」——那需要逐行比对，成本与重建相当，没有意义。
+
+    真正的防线在写入侧：索引由 `repository` 手工同步，所有写入都走那里。
+    本检查只兜「中途失败」这一种。
+
+    开销实测：两万条时 entries 侧 0.5 ms、索引侧 3.2 ms，启动时跑一次可以忽略。
+    """
+    if not has_fts(conn):
+        return False
+    indexed = conn.execute("SELECT count(*) AS c FROM entries_fts").fetchone()["c"]
+    total = conn.execute("SELECT count(*) AS c FROM entries").fetchone()["c"]
+    return indexed == total
+
+
+def rebuild_fts(conn: sqlite3.Connection) -> int:
+    """按 entries 重建全文索引，返回写入的条数。
 
     entries 是唯一事实来源，所以索引可以整体丢弃重建，无需逐版本迁移脚本。
     这也是把 FTS 表与主表松耦合的收益。
+
+    **本函数不提交事务**，事务边界由调用方决定：`init_db` 把它包在自己的事务里，
+    与补列、版本推进一起成败；界面上的「重建索引」按钮则自己 commit / rollback。
+    若在这里 commit，`init_db` 的回滚保护就失效了——DROP 已被提交，回滚只能撤回
+    后面的 CREATE，留下一个真正不存在的索引。
+
+    这一点是实测出来的：先 DROP 再 CREATE 的两步若各自提交，中途失败后库里
+    既没有旧索引也没有新索引，而 `has_fts` 只认表名存在，下次启动会认为一切正常。
     """
     conn.execute("DROP TABLE IF EXISTS entries_fts")
     conn.execute(FTS_DDL)
@@ -249,6 +276,7 @@ def _rebuild_fts(conn: sqlite3.Connection) -> None:
     for row in conn.execute("SELECT * FROM entries").fetchall():
         entry = Entry.from_row(row)
         conn.execute(insert, (entry.id, *fts_values(entry)))
+    return conn.execute("SELECT count(*) AS c FROM entries_fts").fetchone()["c"]
 
 
 def to_bigram(text: str) -> str:
@@ -315,47 +343,71 @@ def init_db(conn: sqlite3.Connection) -> None:
       只对新库生效。
     - entries_fts：FTS5 虚表不支持 ALTER，列集变化只能整表重建。entries 是
       唯一事实来源，重建即重新索引，不会丢数据。
+
+    **补列、索引重建、版本推进三者是一个事务**。它们共同构成「把老库升级到
+    当前结构」这一件事，拆开提交会留下中间态：补了列但没回填版本、索引被 DROP
+    但没建回来。后者尤其致命，因为 `has_fts` 只看表名，空的索引会被当成正常，
+    用户从此搜不到任何东西且程序不报错。
+
+    建表那一句 `executescript(DDL)` 刻意留在事务外：sqlite3 的 `executescript`
+    在执行前会隐式提交待处理事务，包进去也关不住它。好在那些语句全是
+    `IF NOT EXISTS`，幂等，失败重来即可。
     """
+    if conn.in_transaction:
+        # 调用方可能刚写完数据还没提交。这里先落盘，否则下面的 BEGIN 会失败，
+        # 而且 executescript 本来也会把它们提交掉，不如显式做。
+        conn.commit()
     conn.executescript(DDL)
 
-    added = _ensure_columns(conn, "entries", ENTRIES_ADDED_COLUMNS)
-    if PROMPT_VERSION_COLUMN in added:
-        # 只在「刚刚补出这一列」时回填。补列是一次性动作：已标注过版本的行
-        # 不能被再次改写，否则维护者递增版本号后，老词条会被重新说成新版生成，
-        # 陈旧提示永远不出现。
-        conn.execute(
-            f"UPDATE entries SET {PROMPT_VERSION_COLUMN} = ? "
-            f"WHERE {PROMPT_VERSION_COLUMN} = 0",
-            (LEGACY_PROMPT_VERSION,),
-        )
-
-    # FTS5 缺失时降级为 LIKE 检索：没有索引只影响速度与排序质量，
-    # 不该让程序直接起不来。search() 内置了 LIKE 回退路径。
-    if not has_fts(conn):
-        try:
-            conn.execute(FTS_DDL)
-        except sqlite3.OperationalError:
-            pass
-    elif fts_columns_present(conn) != FTS_COLUMNS:
-        # 比对真实表结构，而不是信任 meta 里的版本号：版本号只说明「写到过哪一版」，
-        # 不说明「表结构是否真的对」。曾出现过版本号未推进导致升级静默失效的问题。
-        _rebuild_fts(conn)
-
-    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    if row is None:
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),)
-        )
-    else:
-        try:
-            current = int(row["value"])
-        except (TypeError, ValueError):
-            current = 0
-        if current != SCHEMA_VERSION:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        added = _ensure_columns(conn, "entries", ENTRIES_ADDED_COLUMNS)
+        if PROMPT_VERSION_COLUMN in added:
+            # 只在「刚刚补出这一列」时回填。补列是一次性动作：已标注过版本的行
+            # 不能被再次改写，否则维护者递增版本号后，老词条会被重新说成新版生成，
+            # 陈旧提示永远不出现。
             conn.execute(
-                "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+                f"UPDATE entries SET {PROMPT_VERSION_COLUMN} = ? "
+                f"WHERE {PROMPT_VERSION_COLUMN} = 0",
+                (LEGACY_PROMPT_VERSION,),
             )
-    conn.commit()
+
+        # FTS5 缺失时降级为 LIKE 检索：没有索引只影响速度与排序质量，
+        # 不该让程序直接起不来。search() 内置了 LIKE 回退路径。
+        if not has_fts(conn):
+            try:
+                conn.execute(FTS_DDL)
+            except sqlite3.OperationalError:
+                pass
+        elif fts_columns_present(conn) != FTS_COLUMNS:
+            # 比对真实表结构，而不是信任 meta 里的版本号：版本号只说明「写到过哪一版」，
+            # 不说明「表结构是否真的对」。曾出现过版本号未推进导致升级静默失效的问题。
+            rebuild_fts(conn)
+        elif not fts_in_sync(conn):
+            # 列集对得上，但条数对不上：上次的 DROP 建了一半就断了，或索引里留着
+            # 已删词条的残行。列集检查看不见这一类，必须单独查一次。
+            rebuild_fts(conn)
+
+        row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),)
+            )
+        else:
+            try:
+                current = int(row["value"])
+            except (TypeError, ValueError):
+                current = 0
+            if current != SCHEMA_VERSION:
+                conn.execute(
+                    "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+                )
+        conn.commit()
+    except Exception:
+        # 没有这一句，失败后连接停在 in_transaction 上，下一次任意 commit()
+        # 都会把半成品一并提交——`upsert` 的注释里记过同一个坑。
+        conn.rollback()
+        raise
 
 
 def backup_to(conn: sqlite3.Connection, dest: Path | str) -> Path:

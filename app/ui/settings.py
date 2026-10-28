@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -75,6 +76,7 @@ class SettingsDialog(QDialog):
         parent=None,
         on_theme_preview=None,
         on_restore=None,
+        on_rebuild_index=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
@@ -84,6 +86,9 @@ class SettingsDialog(QDialog):
         # 回调为 None 时（自检、截图脚本）不显示这个按钮，而不是显示一个点了
         # 只报错的按钮。
         self._on_restore = on_restore
+        # 「重建搜索索引」要拿仓储连接并提交事务，同样只有主窗口有。回调返回
+        # 重建后的条数，失败则抛异常，由这里就地显示结果。
+        self._on_rebuild_index = on_rebuild_index
         # 主题即时预览用的回调，由主窗口注入。默认 None 时退化成「保存后才生效」，
         # 这样自检 / 截图脚本沿用旧调用方式也不会坏。
         self._on_theme_preview = on_theme_preview
@@ -230,6 +235,24 @@ class SettingsDialog(QDialog):
         self.btn_restore.clicked.connect(self._restore_backup)
         self.btn_restore.setVisible(on_restore is not None)
 
+        # 索引与词条表是两份数据，靠写入时手工同步。同步漏了不会报错，只是搜不到，
+        # 所以给一个用户自己就能按的按钮，不必等维护者。词条内容一个都不会变，
+        # 只是按现存的词条重新生成一遍索引。
+        self.btn_rebuild_index = QPushButton("重建搜索索引")
+        self.btn_rebuild_index.setObjectName("bare")
+        self.btn_rebuild_index.setToolTip(
+            "搜索查不到本来存在的词时点这里。按当前词条重新生成搜索索引，"
+            "不改动任何词条内容。"
+        )
+        self.btn_rebuild_index.clicked.connect(self._rebuild_index)
+        self.btn_rebuild_index.setVisible(on_rebuild_index is not None)
+
+        # 结果就地显示，与校验提示同一个道理：弹窗会把设置对话框关掉
+        self._rebuild_note = QLabel()
+        self._rebuild_note.setObjectName("muted")
+        self._rebuild_note.setWordWrap(True)
+        self._rebuild_note.setVisible(False)
+
         # 校验提示：就地显示在对话框里，不弹窗——弹窗会把对话框关掉，
         # 用户还得重新填一遍
         self._error = QLabel()
@@ -263,6 +286,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(offline_hint)
         layout.addWidget(storage)
         layout.addWidget(self.btn_restore)
+        layout.addWidget(self.btn_rebuild_index)
+        layout.addWidget(self._rebuild_note)
         layout.addWidget(self.btn_tutorial)
         layout.addWidget(self._probe_note)
         layout.addWidget(self._error)
@@ -347,6 +372,28 @@ class SettingsDialog(QDialog):
     def _restore_backup(self) -> None:
         if self._on_restore is not None:
             self._on_restore()
+
+    def _rebuild_index(self) -> None:
+        """按当前词条重建搜索索引，结果就地显示。
+
+        同步执行，不丢进线程池：重建动的是主连接所在的那个库，交给后台线程
+        就变成两个线程写同一条连接，正是 `db.connect` 注释里记着的那类问题。
+        几千条的重建在百毫秒量级，等得起；真要等到几秒的规模，那也是用户的
+        词库涨到了十几万条，那时该改的是重建策略而不是搬线程。
+        """
+        if self._on_rebuild_index is None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            count = self._on_rebuild_index()
+        except Exception as exc:  # 界面层兜住：异常穿进事件循环会直接崩窗口
+            message = f"重建失败：{exc}"
+        else:
+            message = f"已重建，索引里现在有 {count} 条。"
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._rebuild_note.setText(message)
+        self._rebuild_note.setVisible(True)
 
     def _build_theme_row(self, config: dict) -> QWidget:
         """「界面主题」这一行：下拉框（每项带色块）+ 即时生效。
