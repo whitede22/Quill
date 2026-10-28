@@ -20,6 +20,22 @@ from __future__ import annotations
 
 import re
 
+# 名义表从 `app/theme_meta.py` 取，方向是 ui 依赖它，不是反过来。这些名字仍然
+# 在本模块导出，`selfcheck`、`gui_smoke` 与界面代码沿用 `theme.THEME_DEFAULT`
+# 这类写法即可，不必改成从 theme_meta 取。
+#
+# **不要在这里重新定义它们**。重定义会让配置层与界面层各认一份，配置层放行的
+# 主题名到这边可能是空，`selfcheck` 里 `set(THEMES) == set(THEME_IDS)` 那条
+# 断言就是拦这件事的。
+from ..theme_meta import (  # noqa: F401
+    BG_VEIL_DEFAULT,
+    THEME_DEFAULT,
+    THEME_IDS,
+    VEIL_NAMES,
+    theme_id_of,
+    veil_level,
+)
+
 # ---------------------------------------------------------------------------
 # 一、底座：深浅两份
 #
@@ -141,10 +157,9 @@ _ACCENTS: dict[str, dict[str, str]] = {
     },
 }
 
-THEME_DEFAULT = "ink"
-
-# 顺序即设置界面下拉框的顺序，第一条是默认。
-_THEME_ORDER = ("ink", "sage", "clay", "plum", "graphite", "night")
+# 顺序即设置界面下拉框的顺序，第一条是默认。取自名义表，不在这里重抄一份：
+# 抄一份的后果是「加了新主题、只在一处加」，而调色板里根本没有它。
+_THEME_ORDER = THEME_IDS
 
 # 底座归属：谁用深色那份。
 _DARK_THEMES = frozenset({"night"})
@@ -206,24 +221,9 @@ _VEIL_DARK = {"soft": 96, "medium": 84, "bold": 72}
 # 直接引用；换主题时走 `palette(tid)["veil"]`。绑成字典而不是元组，是因为调用方
 # 既迭代档位名，也用它按名取值。
 BG_VEIL_LEVELS = dict(_VEIL_LIGHT)
-BG_VEIL_DEFAULT = "medium"
 
-# 档位名的全集与顺序。深浅两边的键相同，所以这一个元组就够。
-_VEIL_NAMES = ("soft", "medium", "bold")
-
-
-def veil_level(text: object) -> str:
-    """把配置里的档位名归一到合法值。不认识的、写坏的、类型不对的一律退回默认。
-
-    只归一档位名、不需要主题参数——正因为**名**在深浅两边是共用的。
-
-    `isinstance` 那道判断不能省：配置是从磁盘读的，`load_config()` 的容错策略是
-    「类型不对也不抛」。直接 `text in _VEIL_LIGHT` 会在遇到 `[]` / `{}` 这类
-    不可哈希的值时抛 `TypeError`——那正是它承诺不会发生的事。
-    """
-    if not isinstance(text, str):
-        return BG_VEIL_DEFAULT
-    return text if text in _VEIL_LIGHT else BG_VEIL_DEFAULT
+# 档位名与默认档来自 `app/theme_meta.py`，见文件顶部导入块。档位**值**留在这里，
+# 因为值随底座变化（同一个 58% 在深色底上只剩 3.2:1），属于渲染层的事实。
 
 
 # ---------------------------------------------------------------------------
@@ -238,15 +238,8 @@ def theme_ids() -> list[str]:
     return list(_THEME_ORDER)
 
 
-def theme_id_of(text: object) -> str:
-    """把配置里的主题名归一到合法值。不认识的一律退回默认。
-
-    同 `veil_level()`：配置来自磁盘，`[]` / `{}` 之类的不可哈希值必须先挡掉，
-    否则 `in` 会抛 `TypeError`。
-    """
-    if not isinstance(text, str):
-        return THEME_DEFAULT
-    return text if text in THEMES else THEME_DEFAULT
+# `theme_id_of()` 来自 `app/theme_meta.py`。它判的是名义表 `THEME_IDS`，不是这里
+# 的 `THEMES` 键，所以两者必须一致，由 `selfcheck` 的集合相等断言守着。
 
 
 def palette(theme_id: object) -> dict[str, object]:

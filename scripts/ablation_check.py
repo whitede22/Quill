@@ -260,8 +260,8 @@ ABLATIONS: list[tuple[str, str, str, str, str]] = [
         "A17 背景透出档位",
         "背景从面板后透出多少由用户选。抽走后三档长得一模一样，"
         "那个下拉框白做了——用户调它，画面纹丝不动",
-        "app/ui/theme.py",
-        "    return text if text in _VEIL_LIGHT else BG_VEIL_DEFAULT\n",
+        "app/theme_meta.py",
+        "    return text if text in VEIL_NAMES else BG_VEIL_DEFAULT\n",
         "    return BG_VEIL_DEFAULT  # 消融：档位一律退回默认，选了等于没选\n",
     ),
     (

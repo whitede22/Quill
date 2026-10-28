@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -68,6 +69,7 @@ from app.core.exporter import (  # noqa: E402
 )
 from app.core.exporter import _PDF_RULE_COLOR  # noqa: E402
 from app.core.lemmatizer import candidates as lemma_candidates  # noqa: E402
+from app import theme_meta as theme_meta_mod  # noqa: E402
 from app.ui import theme as theme_mod  # noqa: E402
 from app.ui import background as background_mod  # noqa: E402
 from app.ui.background import BackgroundRenderer, apply_blur, scale_cover  # noqa: E402
@@ -4586,6 +4588,67 @@ def main() -> int:
     # （这个数字会红，正是它存在的意义：新增一处「直接压在原图上」的控件时，
     # 忘记登记的地方会被它抓出来——最透那一档下那处文字会读不出来。）
     _levels = theme_mod.BG_VEIL_LEVELS
+    # 依赖方向。配置属于数据层，原先从 `ui.theme` 取默认值，等于数据层 import 界面
+    # 包。这条必须在子进程里验：本进程早已 import 过 Qt，`sys.modules` 里一定有它，
+    # 在进程内看一眼恒为假，属于「跑起来永远绿」的断言，比没有还危险。
+    _probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, %r); import app.config; "
+            "print(sum(m.startswith(('PySide6', 'shiboken')) for m in sys.modules))"
+            % str(ROOT),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(ROOT),
+    )
+    check(
+        "导入配置模块不连带拉起 Qt（数据层不依赖界面包）",
+        _probe.stdout.strip() == "0",
+        f"rc={_probe.returncode} 输出={_probe.stdout.strip()!r} "
+        f"错误={_probe.stderr.strip()[-160:]!r}",
+    )
+    # 上一条只防「实际拉起了 Qt」。`ui.theme` 眼下是纯字符串字典，不 import Qt，
+    # 所以 `config` 改成从它取值时上一条仍然是绿的，层次倒置就这么溜过去了。
+    # 这条查的是方向本身：配置模块的 import 语句里不许出现 ui 包。
+    _cfg_tree = ast.parse((ROOT / "app" / "config.py").read_text(encoding="utf-8"))
+    _cfg_targets: list[str] = []
+    for _node in ast.walk(_cfg_tree):
+        if isinstance(_node, ast.ImportFrom):
+            _cfg_targets.append("." * (_node.level or 0) + (_node.module or ""))
+        elif isinstance(_node, ast.Import):
+            _cfg_targets.extend(_alias.name for _alias in _node.names)
+    _cfg_ui = [t for t in _cfg_targets if "ui" in t.split(".")]
+    check(
+        "配置模块不 import 界面包（数据层不依赖 ui，方向只能单向）",
+        not _cfg_ui,
+        f"命中 {_cfg_ui}，扫到 {sorted(set(_cfg_targets))}",
+    )
+    # 名义表在 `app/theme_meta.py`，调色板由它组装，但组装之后就是两份数据了。
+    # 往名义表里加一个 id 而忘了配强调色，`theme_id_of()` 会放行到一个取不到的
+    # 调色板；反过来在 ui 层多组一套，配置层又不认。两个方向都要拦。
+    #
+    # 这条排在档位断言之前：后者要拿调色板取值，调色板缺一套时它会先崩，
+    # 崩了就把后面几百条断言一起带走，看着像「全绿」实为「没跑」。
+    check(
+        "主题 id 名义表与调色板键集一致（配置层放行的名字，渲染层得真有这套）",
+        set(theme_mod.THEMES) == set(theme_meta_mod.THEME_IDS),
+        f"调色板 {sorted(theme_mod.THEMES)} 名义表 {sorted(theme_meta_mod.THEME_IDS)}",
+    )
+    # 深色那套不写死 id：写死 `night` 时，一旦它没被组进来就变成 KeyError，
+    # 同样是「崩」而不是「红」，且崩在这里就没机会报出上面那条。
+    _dark_pal = next((p for p in theme_mod.THEMES.values() if p.get("dark")), None)
+    check(
+        "档位名表与两套值表的键一致（放行一个没有值的档位，取 veil 时就是空）",
+        _dark_pal is not None
+        and tuple(theme_meta_mod.VEIL_NAMES)
+        == tuple(_levels)
+        == tuple(_dark_pal["veil"]),
+        f"名表 {theme_meta_mod.VEIL_NAMES} 浅 {tuple(_levels)} "
+        f"深 {tuple(_dark_pal['veil']) if _dark_pal else '找不到深色主题'}",
+    )
     _per_level = 9
     check(
         "有背景时主要的面半透明，且每个档位各有一条规则（图片才透得上来）",

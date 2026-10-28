@@ -19,7 +19,12 @@ import shutil
 from pathlib import Path
 
 from . import atomic
-from .ui.theme import BG_VEIL_DEFAULT, THEME_DEFAULT, theme_id_of, veil_level
+
+# 主题与档位的名义表从 `theme_meta` 取，不从 `ui.theme` 取。配置属于数据层，
+# 数据层 import 界面包是方向反了：本模块被自检、报告生成这类无界面代码共用，
+# 一旦界面包将来真的拉起 Qt，这些消费方会跟着被拖进去，而且不会有任何报错。
+# 自检里有一条子进程断言：导入本模块之后，不得出现 PySide6 或 shiboken。
+from .theme_meta import BG_VEIL_DEFAULT, THEME_DEFAULT, theme_id_of, veil_level
 
 # 软件名。窗口标题、应用名、数据目录、exe 名都从这里派生，避免「同一属性
 # 有多份定义」。旧名 Lexicon 已于 2026-10 改为 Quill。
