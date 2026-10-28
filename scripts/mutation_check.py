@@ -1854,6 +1854,42 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         "scripts/selfcheck.py",
         "结构正确时不重建索引",
     ),
+    (
+        # 把线程归属放回去，共享连接又变回「不报错但事务互相踩」。
+        "db 连接放宽线程归属",
+        "app/core/db.py",
+        "    conn = sqlite3.connect(str(path))",
+        "    conn = sqlite3.connect(str(path), check_same_thread=False)",
+        "scripts/selfcheck.py",
+        "主连接拒绝在别的线程上使用",
+    ),
+    (
+        # 克隆偷懒返回自己：后台任务拿到的还是主线程那条连接。
+        "仓储克隆退回共享同一实例",
+        "app/core/repository.py",
+        "        return Repository(connect(self.db_path))",
+        "        return self",
+        "scripts/selfcheck.py",
+        "克隆出来的是另一条连接",
+    ),
+    (
+        # 保留 with 结构但让它不互斥，比删掉三行更像一次「重构失误」。
+        "离线词库懒加载去掉锁",
+        "app/providers/offline.py",
+        "            with self._conn_lock:",
+        "            if True:",
+        "scripts/selfcheck.py",
+        "并发首次访问只打开一条词库连接",
+    ),
+    (
+        # 后台查词改回直接把主线程的 service 交给 worker。
+        "主窗口查词退回共享主连接",
+        "app/ui/main_window.py",
+        "            self._worker_lookup,\n            word,",
+        "            self.service.lookup,\n            word,",
+        "scripts/gui_smoke.py",
+        "生词本模式查词照常落库",
+    ),
 ]
 
 

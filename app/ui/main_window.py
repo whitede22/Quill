@@ -1363,6 +1363,51 @@ class MainWindow(QMainWindow):
         self._import_origin = "批量查词"
         self._start_import(parsed)
 
+    def _worker_service(self) -> tuple[DictionaryService, Repository]:
+        """为后台线程准备一套自带连接的服务。
+
+        主线程这条连接有线程归属（见 `db.connect`）。把 `self.service` 直接
+        丢给 worker，等于让两个线程在同一条连接上提交事务；CPython 不报错，
+        事务却会互相踩。所以 worker 拿到的服务必须用 `Repository.clone()` 另开
+        一条连接。
+
+        Provider 跟着服务一起共享：它是无状态的 HTTP 客户端配置，每次请求自建
+        `httpx.Client`，没有可被两个线程同时写的东西。库连接才是那个不能共享的。
+        """
+        repo = self.repo.clone()
+        return DictionaryService(repo, self.service.provider), repo
+
+    def _worker_lookup(self, word: str):
+        """后台线程里的查词。连接用完必须关，否则每查一次开一条。"""
+        service, repo = self._worker_service()
+        try:
+            return service.lookup(word)
+        finally:
+            repo.close()
+
+    def _worker_lookup_phrase(self, text: str):
+        service, repo = self._worker_service()
+        try:
+            return service.lookup_phrase(text)
+        finally:
+            repo.close()
+
+    def _worker_refresh(self, word: str, accept_fallback: bool = True):
+        service, repo = self._worker_service()
+        try:
+            return service.refresh(word, accept_fallback=accept_fallback)
+        finally:
+            repo.close()
+
+    def _worker_import(self, batch, known, is_cancelled):
+        service, repo = self._worker_service()
+        try:
+            return run_import(
+                service, repo, batch, known=known, is_cancelled=is_cancelled
+            )
+        finally:
+            repo.close()
+
     def _lookup_word(self, word: str) -> None:
         # 查询会切换当前词条，压在内存里的备注先落盘，否则会丢
         self._flush_edits()
@@ -1370,7 +1415,7 @@ class MainWindow(QMainWindow):
         seq = self._next_seq()
         self._set_busy(True, f"正在查询「{word}」…")
         submit(
-            self.service.lookup,
+            self._worker_lookup,
             word,
             on_success=lambda result, s=seq: self._on_lookup_ok(result, s),
             on_error=lambda message, s=seq: self._on_error(message, s),
@@ -1409,7 +1454,7 @@ class MainWindow(QMainWindow):
         seq = self._next_seq()
         self._set_busy(True, f"正在查询词组「{text}」…")
         submit(
-            self.service.lookup_phrase,
+            self._worker_lookup_phrase,
             text,
             on_success=lambda result, s=seq: self._on_phrase_ok(result, s),
             on_error=lambda message, s=seq: self._on_error(message, s),
@@ -1459,7 +1504,7 @@ class MainWindow(QMainWindow):
         # 因此必须走专用回调。两者契约不同，接错会抛 TypeError，
         # 界面表现为「重新查询必失败」（尽管库里其实已经更新成功）。
         submit(
-            self.service.refresh,
+            self._worker_refresh,
             word,
             on_success=lambda entry, s=seq: self._on_refresh_ok(entry, s),
             on_error=lambda message, s=seq: self._on_error(message, s),
@@ -1745,7 +1790,7 @@ class MainWindow(QMainWindow):
         # `accept_fallback=False`：接口这次没答上来的词条抛错而不是拿兜底内容，
         # 于是它保持原样。批量跑几十条时没人盯得住每一条，这个判定必须由程序做。
         submit(
-            self.service.refresh,
+            self._worker_refresh,
             lemma,
             accept_fallback=False,
             on_success=self._on_refresh_one_ok,
@@ -2298,9 +2343,7 @@ class MainWindow(QMainWindow):
         del self._import_queue[:IMPORT_BATCH]
         size = len(batch)
         submit(
-            run_import,
-            self.service,
-            self.repo,
+            self._worker_import,
             batch,
             known=self._import_known,
             is_cancelled=lambda: self._import_cancelled,

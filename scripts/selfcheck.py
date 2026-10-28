@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import glob
 import tokenize
@@ -1198,6 +1199,162 @@ def main() -> int:
     )
     check("手工重建后判定同步", fts_in_sync(manual_reopen))
     manual_reopen.close()
+
+    # ---- 8f. 连接归属：后台任务不得共用主线程那条连接 ----
+    #
+    # 这里不模拟并发写，只钉住**入口**。原因要说清：CPython 的 sqlite3 是
+    # serialized 编译，两个线程共享一条连接既不崩也不抛错，A 线程的 commit 会
+    # 把 B 线程写了一半的事务一并提交——这类故障在测试里几乎撞不上，只能靠
+    # 结构上不允许它发生。主连接在别的线程上必须用不了，后台要用的连接必须由
+    # `clone()` 另开。判据打在「跨线程用主连接会抛 ProgrammingError」上，把
+    # `check_same_thread` 放宽回 False 就会红。
+    owner = connect(old_dir / "owner.db")
+    init_db(owner)
+    owner_repo = Repository(owner)
+    owner_repo.upsert(
+        Entry(lemma="owned", definition_zh="主线程写的", definition_en="own")
+    )
+    check(
+        "仓储从连接解析出库文件路径",
+        owner_repo.db_path is not None
+        and owner_repo.db_path.resolve() == (old_dir / "owner.db").resolve(),
+        str(owner_repo.db_path),
+    )
+
+    crossed: dict[str, object] = {}
+
+    def _touch_owner() -> None:
+        try:
+            owner.execute("SELECT count(*) FROM entries").fetchone()
+        except sqlite3.Error as exc:
+            crossed["error"] = exc
+        else:
+            crossed["error"] = None
+
+    _t = threading.Thread(target=_touch_owner)
+    _t.start()
+    _t.join()
+    check(
+        "主连接拒绝在别的线程上使用",
+        isinstance(crossed.get("error"), sqlite3.ProgrammingError),
+        f"实际={crossed.get('error')!r}",
+    )
+
+    cloned: dict[str, object] = {}
+
+    def _write_via_clone() -> None:
+        try:
+            worker_repo = owner_repo.clone()
+        except Exception as exc:  # noqa: BLE001 - 失败要被判据看见
+            cloned["error"] = exc
+            return
+        try:
+            cloned["distinct"] = worker_repo.conn is not owner_repo.conn
+            worker_repo.upsert(
+                Entry(lemma="fromworker", definition_zh="子线程写的", definition_en="w")
+            )
+            cloned["rows"] = worker_repo.count()
+        except Exception as exc:  # noqa: BLE001
+            cloned["error"] = exc
+        finally:
+            # 关闭也要接住。克隆被写坏时它关的是主连接，在子线程上会抛
+            # ProgrammingError；漏出去就是一条未捕获异常，而测试工具把它
+            # 记成「代码崩溃」，比「哪条判据红了」难读得多。
+            try:
+                worker_repo.close()
+            except Exception as exc:  # noqa: BLE001
+                cloned.setdefault("error", exc)
+
+    _t2 = threading.Thread(target=_write_via_clone)
+    _t2.start()
+    _t2.join()
+    check(
+        "克隆连接可在子线程内建起并写入",
+        "error" not in cloned,
+        f"实际={cloned.get('error')!r}",
+    )
+    check("克隆出来的是另一条连接", cloned.get("distinct") is True)
+
+    # 读主连接也要容错。克隆被写坏时，子线程在 finally 里关掉的正是主连接，
+    # 这两句会直接抛 ProgrammingError；不接住的话整个脚本崩在这一行，后面
+    # 六百多条断言一条都跑不到，看到的是 traceback 而不是「哪条判据红了」。
+    def _owner_count() -> int:
+        try:
+            return owner_repo.count()
+        except sqlite3.Error:
+            return -1
+
+    def _owner_rows() -> int:
+        try:
+            return owner.execute("SELECT count(*) FROM entries").fetchone()[0]
+        except sqlite3.Error:
+            return -1
+
+    check(
+        "子线程写入对主连接可见",
+        _owner_count() == 2,
+        f"{_owner_count()} != 2（-1 表示主连接已被误关）",
+    )
+    check(
+        "克隆关闭后主连接仍可用",
+        _owner_rows() == 2,
+        f"{_owner_rows()} != 2（-1 表示主连接已被误关）",
+    )
+    owner.close()
+
+    # 内存库另开连接只会得到一个空库，静默放行比报错更难查
+    memory_repo = Repository(connect(":memory:"))
+    check("内存库的连接没有库文件路径", memory_repo.db_path is None, str(memory_repo.db_path))
+    try:
+        memory_repo.clone()
+    except RuntimeError:
+        check("内存库上克隆给出明确错误", True)
+    else:
+        check("内存库上克隆给出明确错误", False, "没有抛错")
+    memory_repo.close()
+
+    # ---- 8g. 离线词库连接的懒加载 ----
+    #
+    # 只读连接被多个线程共用一个句柄是允许的（`open_offline_db` 保留了
+    # `check_same_thread=False`，语句层面由 SQLite 串行化）。但首次打开是
+    # 「判断为空 → 打开 → 赋值」三步，并发进来会各开一条，后赋值的覆盖前一个，
+    # 前一条既没人用也没人关。导入批次正好并发，泄漏会随批次累积。
+    #
+    # 用一个慢速 open 把窗口放大到必然撞上：无锁时 6 个线程会开 6 条，有锁只会
+    # 1 条。判据是次数，不是「没崩」——这类泄漏本来就不崩。
+    from app.providers import offline as _offline_mod  # noqa: PLC0415
+
+    _opens: list[int] = []
+    _real_open = _offline_mod.open_offline_db
+
+    def _slow_open(path):
+        _opens.append(1)
+        time.sleep(0.03)
+        return _real_open(path)
+
+    _offline_mod.open_offline_db = _slow_open
+    try:
+        _lazy_provider = _offline_mod.OfflineDictProvider()
+        _gate = threading.Barrier(6)
+
+        def _hit_offline() -> None:
+            _gate.wait(timeout=5)
+            _lazy_provider._db().execute("SELECT 1").fetchone()
+
+        _threads = [threading.Thread(target=_hit_offline) for _ in range(6)]
+        for _t in _threads:
+            _t.start()
+        for _t in _threads:
+            _t.join()
+        _lazy_provider.close()
+    finally:
+        _offline_mod.open_offline_db = _real_open
+
+    check(
+        "并发首次访问只打开一条词库连接",
+        len(_opens) == 1,
+        f"打开了 {len(_opens)} 条（多余的都是没人关的泄漏）",
+    )
 
     # ---- 9. 词形还原候选 ----
     check("还原 -ing 双写", "run" in lemma_candidates("running"), str(lemma_candidates("running")))

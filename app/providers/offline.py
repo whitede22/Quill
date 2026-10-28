@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from urllib.parse import quote
 
@@ -162,13 +163,27 @@ class OfflineDictProvider:
             )
         self.db_path = Path(db_path)
         self._conn: sqlite3.Connection | None = None
+        self._conn_lock = threading.Lock()
 
     # ---------- 内部 ----------
 
     def _db(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = open_offline_db(self.db_path)
-        return self._conn
+        """懒加载只读词库连接。
+
+        **这把锁防的是漏连接，不是并发读。** 只读连接在 SQLite 的 serialized
+        模式下被多个线程共用一个句柄是允许的（`open_offline_db` 也因此保留
+        `check_same_thread=False`），所以查询本身不加锁。但首次打开是「判断为
+        空 → 打开 → 赋值」三步，两个 worker 同时进来会各开一条，后赋值的那个
+        覆盖前一个，前一条既没人用也没人关。导入批次恰好就是多个任务并发的
+        场景，泄漏会随着批次数累积。
+        """
+        conn = self._conn
+        if conn is None:
+            with self._conn_lock:
+                if self._conn is None:
+                    self._conn = open_offline_db(self.db_path)
+                conn = self._conn
+        return conn
 
     def _row_for(self, surface: str):
         db = self._db()
@@ -241,6 +256,7 @@ class OfflineDictProvider:
         )
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        with self._conn_lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
