@@ -9,18 +9,29 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-# 三档评分。
+# 四档评分。前三档是「记不住 / 拿不准 / 记住了」，第四档专门给「太简单」：
+# 熟词留在队列里天天出现，等于把复习时间浪费在已经会的词上。
 FORGOT = 0
 FUZZY = 1
 REMEMBERED = 2
+EASY = 3
 
 # 难度因子（ease）的下限与初始值。ease 越低，间隔涨得越慢——越难记的词越常回来。
+# 上限是给「太简单」设的：每次 +0.15 不封顶的话，连点十几次之后间隔会涨成
+# 天文数字，那个词等于再也不复习了。
 MIN_EASE = 1.3
+MAX_EASE = 3.0
 INITIAL_EASE = 2.5
 
 # 「记住了」的前两次间隔（天），之后每次乘 ease。
 FIRST_INTERVAL = 1.0
 SECOND_INTERVAL = 6.0
+
+# 「太简单」第一次就给的间隔。跳过 1 天那一步：用户已经明说这个不用练。
+EASY_FIRST_INTERVAL = 4.0
+
+# 「太简单」在已有间隔上再乘的倍数。比「记住了」多跳一步，但不至于让间隔爆炸。
+EASY_BOOST = 1.3
 
 _TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -33,6 +44,8 @@ def sm2(ease: float, interval: float, count: int, grade: int) -> tuple[float, fl
     - 忘了（FORGOT）：ease 扣 0.3，间隔回到 1 天，次数清零。
     - 模糊（FUZZY）：ease 扣 0.15，间隔回到 1 天，次数不变。
     - 记住了（REMEMBERED）：第一次间隔 1 天、第二次 6 天、之后每次乘 ease，次数 +1。
+    - 太简单（EASY）：ease 加 0.15（封顶 3.0），间隔在「记住了」的基础上再乘 1.3，
+      第一次直接给 4 天。次数 +1。
     """
     if grade == FORGOT:
         return max(MIN_EASE, ease - 0.3), FIRST_INTERVAL, 0
@@ -46,6 +59,15 @@ def sm2(ease: float, interval: float, count: int, grade: int) -> tuple[float, fl
         else:
             new_interval = interval * ease
         return ease, new_interval, count + 1
+    if grade == EASY:
+        new_ease = min(MAX_EASE, ease + 0.15)
+        if count == 0:
+            new_interval = EASY_FIRST_INTERVAL
+        elif count == 1:
+            new_interval = SECOND_INTERVAL * EASY_BOOST
+        else:
+            new_interval = interval * new_ease * EASY_BOOST
+        return new_ease, new_interval, count + 1
     raise ValueError(f"未知复习评分：{grade!r}")
 
 

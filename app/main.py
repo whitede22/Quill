@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtGui import QIcon
@@ -18,7 +19,14 @@ from .config import (
     load_config,
     migrate_legacy_home,
 )
-from .core.db import connect, init_db
+from .core import analytics
+from .core.db import (
+    backup_to,
+    connect,
+    init_db,
+    replace_with_staged,
+    stage_restore,
+)
 from .core.dictionary import DictionaryService
 from .core.repository import Repository
 from .providers import build_provider
@@ -178,9 +186,34 @@ def main() -> int:
     repo, service = build_service(conn)
 
     window = MainWindow(repo, service, config)
+
+    def _restore_flow(backup: Path) -> Path:
+        """用备份覆盖词库，返回替换前那份数据的路径。
+
+        放在 main 里是因为**连接在这里**：恢复必须在关闭连接之后才可能替换
+        文件（Windows 会锁住打开的库），而关闭哪个连接只有这里知道。
+
+        三步的顺序都不能换：先做保护性备份 → 把旧库的 WAL 回写并关闭 →
+        替换。少了第一步，用户在恢复之后会觉得「还是原来那份好」而回不去。
+        """
+        guard = backup_to(
+            conn, APP_DIR / f"quill_before_restore_{datetime.now():%Y%m%d-%H%M%S}.db"
+        )
+        staged = stage_restore(backup, DB_PATH)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        replace_with_staged(staged, DB_PATH)
+        return guard
+
+    window.restore_hook = _restore_flow
+
     # 挂到窗口上：窗口活着，监听就在（见 start_activation_server 的说明）。
     start_activation_server(window._restore_from_tray, window)
     window.show()
+
+    # 启动事件放在窗口建好之后：第一次启动时用户还没表态，这次不记；
+    # 之后每次启动记一条，用来看「装了之后有没有再打开」。
+    analytics.record_event("app_started")
 
     try:
         return app.exec()

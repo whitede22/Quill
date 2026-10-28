@@ -846,6 +846,20 @@ EXPECT: dict = {
     "欢迎弹窗被触发": True,
     "版本号已写回": True,
     "版本已最新不再弹": True,
+    # 统计告知页（analytics_check）。两条硬边界：看过说明不等于同意；
+    # 关掉窗口既不是同意也不是拒绝（下次还会问）。
+    "告知页标题": "帮助我们改进 Quill",
+    "告知页按钮": lambda v: v == ["暂不参与", "知道了，继续使用"],
+    "告知页默认没表态": True,
+    "点「知道了」记为同意": True,
+    "点「暂不参与」记为拒绝": True,
+    "只看说明时没有选择按钮": True,
+    "只看说明不改表态": True,
+    "首启先欢迎后告知": ["onboarding", "consent"],
+    "拒绝后开关与表态都落盘": True,
+    "关掉告知页不算同意": True,
+    "已表态不再弹": True,
+    "未勾选记录时拒绝提交报告": (0, True),
     # 复习模式（review_check）。
     "待复习按钮在生词本模式可见": True,
     "新词进入复习计划（待复习数 +1）": True,
@@ -853,7 +867,7 @@ EXPECT: dict = {
     "词组模式隐藏待复习按钮": True,
     "复习会话能取到到期词": True,
     "复习会话正面先看词不翻面": True,
-    "复习会话翻面后给三档评分": lambda v: v == ["忘了", "模糊", "记住了"],
+    "复习会话翻面后给四档评分": lambda v: v == ["忘了", "模糊", "记住了", "太简单"],
     "复习评分推进了记忆状态": True,
     "复习会话评完推进或结束": True,
     # 容器底色（详情区面板 / 对话框）必须由主题给。系统开深色模式时，没有
@@ -874,6 +888,9 @@ def main() -> int:
     from app.ui.onboarding import CURRENT_ONBOARD_VERSION
 
     config["onboard_version"] = CURRENT_ONBOARD_VERSION
+    # 统计告知页同理：它也是模态框，未表态时每次启动都会弹。主流程标记为已表态，
+    # 告知页本身另有场景单独测（见 analytics_check）。
+    config["analytics_consent_decided"] = True
 
     conn = connect(DB_PATH)
     init_db(conn)
@@ -2279,8 +2296,159 @@ def main() -> int:
             flush=True,
         )
 
+    def analytics_check() -> None:
+        """统计告知页：两页的先后、表态才写配置、关掉不算同意、未勾选拒绝提交。
+
+        与 welcome_check 同一个原则：对话框只构造不 exec（exec 是模态阻塞）。
+        这里额外要证明的是「写进文件了」，所以核对读的是磁盘上的配置，而不是内存
+        里那份 dict——`_maybe_show_consent` 同时改内存和文件，只看内存分不出
+        「存了」和「没存」。
+        """
+        import app.config as config_mod
+        import app.ui.consent as cs
+        import app.ui.onboarding as ob
+        import app.ui.settings as sm
+        from app.ui.settings import SettingsDialog
+
+        # ① 告知页的内容与默认态。默认必须是「没表态」，不是「关」——
+        #    这两件事在配置里是两个字段，混成一个的结果是拒绝之后每次启动都再问。
+        dlg = cs.ConsentDialog(window._theme, parent=window)
+        results["告知页标题"] = dlg.windowTitle()
+        results["告知页按钮"] = sorted(b.text() for b in dlg.findChildren(QPushButton))
+        results["告知页默认没表态"] = dlg.choice is None
+
+        # 点哪个按钮就记哪个值。打开弹窗本身不产生任何表态。
+        agree = next(
+            b for b in dlg.findChildren(QPushButton) if b.text() == "知道了，继续使用"
+        )
+        agree.click()
+        results["点「知道了」记为同意"] = dlg.choice is True
+        dlg.deleteLater()
+
+        dlg_no = cs.ConsentDialog(window._theme, parent=window)
+        decline = next(
+            b for b in dlg_no.findChildren(QPushButton) if b.text() == "暂不参与"
+        )
+        decline.click()
+        results["点「暂不参与」记为拒绝"] = dlg_no.choice is False
+        dlg_no.deleteLater()
+
+        # 设置里的「隐私说明」复用同一个对话框，但不给选择按钮：
+        # 那里是复习说明，不该顺手产生一次新的表态。
+        review = cs.ConsentDialog(window._theme, parent=window, review_only=True)
+        results["只看说明时没有选择按钮"] = sorted(
+            b.text() for b in review.findChildren(QPushButton)
+        ) == ["关闭"]
+        results["只看说明不改表态"] = review.choice is None
+        review.deleteLater()
+
+        # ② 首启两页的顺序。两个都是模态框，反序或并行都会把后一个压在底下：
+        #    用户关掉上面那个才发现下面还有一个，离屏环境下则是直接卡死在 exec()。
+        order: list[str] = []
+        ob_orig, cs_orig = ob.OnboardingDialog.exec, cs.ConsentDialog.exec
+        ob.OnboardingDialog.exec = lambda self: (order.append("onboarding"), 0)[1]
+        cs.ConsentDialog.exec = lambda self: (order.append("consent"), 0)[1]
+        saved = dict(window.config)
+        try:
+            window.config["onboard_version"] = 0
+            window.config["analytics_consent_decided"] = False
+            window._maybe_show_first_run()
+        finally:
+            ob.OnboardingDialog.exec = ob_orig
+            cs.ConsentDialog.exec = cs_orig
+        results["首启先欢迎后告知"] = list(order)
+
+        # ③ 明确拒绝 → 开关与「已表态」都真的落到文件里。
+        #    基线刻意设成「开 + 未表态」且与期望值相反，这样两个方向都能失败。
+        #    **内存那一份也要一起重置**：`_maybe_show_consent` 先看 `self.config`，
+        #    只改磁盘的话它会在开头就 return，接下来「什么都没写」会被判成「没写错」。
+        config_mod.save_config(
+            {**config_mod.load_config(), "analytics_enabled": True,
+             "analytics_consent_decided": False}
+        )
+        window.config["analytics_enabled"] = True
+        window.config["analytics_consent_decided"] = False
+
+        def _decline(self):  # noqa: ANN001
+            self.choice = False
+            return 0
+
+        cs.ConsentDialog.exec = _decline
+        try:
+            window._maybe_show_consent()
+        finally:
+            cs.ConsentDialog.exec = cs_orig
+        disk = config_mod.load_config()
+        results["拒绝后开关与表态都落盘"] = (
+            disk.get("analytics_enabled") is False
+            and disk.get("analytics_consent_decided") is True
+        )
+
+        # ④ 关掉窗口（Esc / 右上角）不算同意，也不算拒绝：配置一个字都不写。
+        #    基线设成「开 + 未表态」，若代码把 None 当成某种表态，两半都会变。
+        config_mod.save_config(
+            {**config_mod.load_config(), "analytics_enabled": True,
+             "analytics_consent_decided": False}
+        )
+        window.config["analytics_enabled"] = True
+        window.config["analytics_consent_decided"] = False
+        cs.ConsentDialog.exec = lambda self: 0
+        try:
+            window._maybe_show_consent()
+        finally:
+            cs.ConsentDialog.exec = cs_orig
+        disk = config_mod.load_config()
+        results["关掉告知页不算同意"] = (
+            disk.get("analytics_consent_decided") is False
+            and disk.get("analytics_enabled") is True
+        )
+
+        # ⑤ 已表态就不再弹。
+        asked_again: list[bool] = []
+        cs.ConsentDialog.exec = lambda self: (asked_again.append(True), 0)[1]
+        window.config["analytics_consent_decided"] = True
+        try:
+            window._maybe_show_consent()
+        finally:
+            cs.ConsentDialog.exec = cs_orig
+        results["已表态不再弹"] = not asked_again
+
+        # ⑥ 记录与提交是两个决定：没勾选记录时，「提交报告」直接拒绝，
+        #    连报告都不生成（判定用 build_report 的调用次数，不看文案）。
+        sd = SettingsDialog({**window.config, "analytics_enabled": False}, "", window)
+        said: list[str] = []
+        built: list[int] = []
+        real_box_s = sm.QMessageBox
+        real_build = sm.report.build_report
+
+        class _Box:
+            StandardButton = real_box_s.StandardButton
+
+            @staticmethod
+            def information(parent, title, text, *a, **k):  # noqa: ANN001
+                said.append(text)
+                return _Box.StandardButton.Ok
+
+        sm.QMessageBox = _Box
+        sm.report.build_report = lambda *a, **k: (built.append(1), {})[1]
+        try:
+            sd.analytics.setChecked(False)
+            sd._submit_report()
+        finally:
+            sm.QMessageBox = real_box_s
+            sm.report.build_report = real_build
+        results["未勾选记录时拒绝提交报告"] = (len(built), bool(said))
+        sd.deleteLater()
+
+        # 收尾：把配置恢复成「已表态、关着」，与 main() 开头的基线一致，
+        # 后面场景埋点时不会因为上一段测试的残留而改写统计库。
+        window.config["analytics_enabled"] = False
+        window.config["analytics_consent_decided"] = True
+        window.config["onboard_version"] = saved.get("onboard_version", 0)
+        config_mod.save_config(window.config)
+
     def review_check() -> None:
-        """复习模式：待复习入口的计数、会话的翻面与三档评分、评分落库推进状态。
+        """复习模式：待复习入口的计数、会话的翻面与四档评分、评分落库推进状态。
 
         与 welcome_check 同一个原则：ReviewDialog 只构造不 exec（exec 是模态阻塞）。
         评分走真实仓储（apply_review），所以「点评分」这一下真的改库、真的推进 SM-2，
@@ -2317,7 +2485,7 @@ def main() -> int:
             not dlg.revealed and first is not None and bool(first.lemma)
         )
         dlg._reveal()
-        results["复习会话翻面后给三档评分"] = [b.text() for b in dlg._grade_buttons]
+        results["复习会话翻面后给四档评分"] = [b.text() for b in dlg._grade_buttons]
         before_id = int(first.id) if first is not None else None
         before_count = (
             repo.get_by_id(before_id).review_count if before_id is not None else None
@@ -3546,6 +3714,10 @@ def main() -> int:
     QTimer.singleShot(10100, _guard(theme_check))
     QTimer.singleShot(10300, _guard(welcome_check))
     QTimer.singleShot(10400, _guard(review_check))
+    # 告知页排在 review 之后、new_features 之前。它会改写磁盘上的配置来造
+    # 「未表态」的基线，收尾时又恢复成「已表态、关着」——放在靠后的位置可以
+    # 少牵连别的阶段读到的配置。
+    QTimer.singleShot(10450, _guard(analytics_check))
     # 这一阶段自己带一个 stub 服务端并真发一次请求，加上几处防抖等待，
     # 整体明显比别的阶段长；导入阶段因此往后让出足够的时间窗。
     QTimer.singleShot(10600, _guard(new_features_check))

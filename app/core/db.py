@@ -407,3 +407,70 @@ def backup_to(conn: sqlite3.Connection, dest: Path | str) -> Path:
     for stale in (dest.with_name(dest.name + "-wal"), dest.with_name(dest.name + "-shm")):
         stale.unlink(missing_ok=True)
     return dest
+
+
+def inspect_backup(path: Path | str) -> str:
+    """检查一份备份能不能用，返回空串表示可用，否则返回一句原因。
+
+    三条都要查，少一条都会让用户在用坏文件覆盖之后才发现：
+    文件在不在、`integrity_check` 过不过、里面有没有 `entries` 表。
+    最后一条专门防「拿别的 sqlite 文件当备份」——那种文件完整性检查是 ok 的。
+    """
+    target = Path(path)
+    if not target.is_file():
+        return "找不到这个文件"
+    try:
+        conn = sqlite3.connect(f"file:{target.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return f"打不开：{exc}"
+    try:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        if row is None or row[0] != "ok":
+            return f"完整性检查未通过：{row[0] if row else '无返回'}"
+        tables = {
+            item[0]
+            for item in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "entries" not in tables:
+            return "这个文件里没有词条表，不像是 Quill 的备份"
+    except sqlite3.Error as exc:
+        return f"读取失败：{exc}"
+    finally:
+        conn.close()
+    return ""
+
+
+def stage_restore(backup: Path | str, target: Path | str) -> Path:
+    """把备份复制到目标库旁边的临时文件，供调用方在**关闭连接之后**替换。
+
+    先校验再复制。复制而不是直接 `os.replace(backup, target)`：备份文件本身
+    要留着，用户可能想保留它，或者这次恢复只是为了拿回其中几条。
+    """
+    source = Path(backup)
+    problem = inspect_backup(source)
+    if problem:
+        raise sqlite3.DatabaseError(problem)
+    dest = Path(target)
+    tmp = dest.with_name(dest.name + ".restore")
+    tmp.unlink(missing_ok=True)
+    # 按字节复制：源文件可能仍是 WAL 模式，但 inspect 时只读打开、不写入，
+    # 主文件本身是完整的（backup_to 产出的就是 DELETE 模式的单文件）。
+    tmp.write_bytes(source.read_bytes())
+    return tmp
+
+
+def replace_with_staged(staged: Path | str, target: Path | str) -> None:
+    """用已校验的临时文件替换目标库。
+
+    调用前必须做两件事，顺序不能反：**先 `PRAGMA wal_checkpoint(TRUNCATE)`
+    把日志回写进主文件，再关闭所有连接**。WAL 里压着已提交但还没回写的页，
+    直接删 `-wal` 等于把它们扔掉。
+
+    Windows 上打开的 sqlite 连接会锁住文件，`os.replace` 会抛
+    PermissionError——那正是「恢复看起来成功、实际没换」的典型来源，所以
+    替换失败必须让异常往上抛，由界面如实说。
+    """
+    target_path = Path(target)
+    for suffix in ("-wal", "-shm"):
+        target_path.with_name(target_path.name + suffix).unlink(missing_ok=True)
+    os.replace(staged, target_path)

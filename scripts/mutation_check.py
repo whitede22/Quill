@@ -620,13 +620,7 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
     (
         "keystore.py 密钥改回非原子直写（失败留下半截密文）",
         "app/security/keystore.py",
-        '    tmp = path.with_name(path.name + ".tmp")\n'
-        "    try:\n"
-        '        tmp.write_text(encrypt_text(api_key), encoding="ascii")\n'
-        "        os.replace(tmp, path)\n"
-        "    except Exception:\n"
-        "        tmp.unlink(missing_ok=True)\n"
-        "        raise\n",
+        '    atomic_write_text(path, encrypt_text(api_key), encoding="ascii")\n',
         '    path.write_text(encrypt_text(api_key), encoding="ascii")\n',
         "scripts/selfcheck.py",
         "写入失败时保留原值",
@@ -1709,6 +1703,122 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         '    if key == "offline":\n        return f"来源 {provider_label(source)}"\n',
         "scripts/selfcheck.py",
         "离线词条标签写「离线待重查」",
+    ),
+    # ---------- 本地统计：白名单与开关 ----------
+    (
+        # 开关只在界面上关掉、写入路径照旧：用户点了「不参与」，事件继续落盘。
+        # 这种越界不会报错，只能靠「关掉之后库里一条都不该多」来抓。
+        "analytics 不看开关，未授权也照记",
+        "app/core/analytics.py",
+        "        if not enabled():\n            return False\n",
+        "",
+        "scripts/selfcheck.py",
+        "关闭统计后不再写入",
+    ),
+    (
+        # 属性白名单失效：业务侧多传一个字段就跟着进库。统计库一旦收自由字段，
+        # 「不记生词和笔记」这句承诺就只剩注释里那一行。
+        #
+        # 第一版变异写的是「未知键当成 count 校验」，结果 MISSED——多传的那个
+        # 字符串本来就不满足 count，照样被丢，等于没变异。可见那条断言当时
+        # 只判了「该在的在」，没判「不该在的不在」，两处都已改。
+        "analytics 未知属性原样放行（不再按白名单过滤）",
+        "app/core/analytics.py",
+        "        kind = spec.get(key)\n        if kind is None:\n            continue\n",
+        "        kind = spec.get(key)\n"
+        "        if kind is None:\n"
+        "            clean[key] = value\n"
+        "            continue\n",
+        "scripts/selfcheck.py",
+        "事件写入且属性经白名单过滤",
+    ),
+    (
+        # 未知事件名照样入库：事件表变成自由文本入口，等于把「只记这七件事」
+        # 换成「谁调用谁说了算」。
+        "analytics 未知事件名不再拒绝",
+        "app/core/analytics.py",
+        "        spec = EVENTS.get(event_name)\n        if spec is None:\n            return False\n",
+        "        spec = EVENTS.get(event_name, {})\n",
+        "scripts/selfcheck.py",
+        "未知事件名被拒绝",
+    ),
+    (
+        # 只看表名、不看完整性：被截断或被写坏的备份同样有 entries 表，
+        # 放行之后用户拿它覆盖，词库就没了。
+        "db.inspect_backup 不查 integrity_check",
+        "app/core/db.py",
+        '        row = conn.execute("PRAGMA integrity_check").fetchone()\n'
+        '        if row is None or row[0] != "ok":\n'
+        "            return f\"完整性检查未通过：{row[0] if row else '无返回'}\"\n",
+        '        row = ("ok",)\n'
+        '        if row is None or row[0] != "ok":\n'
+        "            return f\"完整性检查未通过：{row[0] if row else '无返回'}\"\n",
+        "scripts/selfcheck.py",
+        "损坏的备份被拒绝",
+    ),
+    (
+        # 只查完整性、不查有没有词条表：拿任何一个别的 sqlite 文件当备份都会
+        # 通过，替换之后用户的词库变成别人的表。
+        "db.inspect_backup 不查 entries 表",
+        "app/core/db.py",
+        '        if "entries" not in tables:\n'
+        '            return "这个文件里没有词条表，不像是 Quill 的备份"\n',
+        '        if "entries" not in tables:\n            pass\n',
+        "scripts/selfcheck.py",
+        "完整性 ok 但没有词条表被拒绝",
+    ),
+    (
+        # 暂存改成把备份搬走：恢复一次，用户选的备份文件就没了。再恢复一次
+        # 只能重新去挑，而界面上什么都没提示。
+        "db.stage_restore 把备份搬走而不是复制",
+        "app/core/db.py",
+        "    tmp.write_bytes(source.read_bytes())\n",
+        "    os.replace(source, tmp)\n",
+        "scripts/selfcheck.py",
+        "暂存不动备份本身",
+    ),
+    (
+        # 不清 -wal：旧日志里的已提交页会在新库上回放，恢复出来的是一份混合体，
+        # 而且不报错。
+        "db.replace_with_staged 不清残留的 -wal/-shm",
+        "app/core/db.py",
+        '    for suffix in ("-wal", "-shm"):\n'
+        "        target_path.with_name(target_path.name + suffix).unlink(missing_ok=True)\n",
+        "    for suffix in ():\n"
+        "        target_path.with_name(target_path.name + suffix).unlink(missing_ok=True)\n",
+        "scripts/selfcheck.py",
+        "替换清掉了残留日志",
+    ),
+    # ---------- 统计告知页：顺序与表态 ----------
+    (
+        # 两页换个先后。都是模态框，后弹的压住先弹的；离屏环境下表现为整个进程
+        # 卡在 exec() 上，且不报错。
+        "main_window 首启把告知页排在欢迎页前面",
+        "app/ui/main_window.py",
+        "        self._maybe_show_onboarding()\n        self._maybe_show_consent()\n",
+        "        self._maybe_show_consent()\n        self._maybe_show_onboarding()\n",
+        "scripts/gui_smoke.py",
+        "首启先欢迎后告知",
+    ),
+    (
+        # 关掉窗口当成同意：用户按 Esc 就被算作参与了统计。这类越界最讲究
+        # 「有没有被记成同意」，界面上完全看不出来。
+        "main_window 把「关掉告知页」当成同意",
+        "app/ui/main_window.py",
+        "        if dialog.choice is None:\n            return\n",
+        "        if dialog.choice is None:\n            dialog.choice = True\n",
+        "scripts/gui_smoke.py",
+        "关掉告知页不算同意",
+    ),
+    (
+        # 记录与提交合并成一个决定：勾着记录就默认允许发出去，而用户在告知页
+        # 上看过的那句话是「提交是另一件事」。
+        "settings 未勾选记录也照样生成报告",
+        "app/ui/settings.py",
+        "        if not self.analytics.isChecked():\n",
+        "        if False:\n",
+        "scripts/gui_smoke.py",
+        "未勾选记录时拒绝提交报告",
     ),
 ]
 

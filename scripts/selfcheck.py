@@ -42,6 +42,9 @@ from app.core.db import (  # noqa: E402
     connect,
     fts_values,
     init_db,
+    inspect_backup,
+    replace_with_staged,
+    stage_restore,
     to_bigram,
 )
 from app.core.dictionary import (  # noqa: E402
@@ -1292,6 +1295,103 @@ def main() -> int:
     check("目标不可写时抛错", raised)
     check("失败后清理临时文件", not (tmpdir / "blocked_dir.tmp").exists())
     check("失败后未破坏原目标", blocked.is_dir())
+
+    # ---- 13b. 备份恢复：校验、暂存、替换 ----
+    # 恢复是拿一个文件覆盖用户整个词库，所以每条判据都要能读出「换没换」，
+    # 而不是「没抛异常」。三段分开测：校验只看返回值，暂存看文件，
+    # 替换必须真的读出新内容。
+    fresh_backup = tmpdir / "restore_src.db"
+    backup_to(conn, fresh_backup)
+    check("可用备份校验通过", inspect_backup(fresh_backup) == "", inspect_backup(fresh_backup))
+
+    missing_reason = inspect_backup(tmpdir / "no_such_backup.db")
+    check("不存在的备份被拒绝", missing_reason != "", missing_reason)
+
+    junk = tmpdir / "junk_backup.db"
+    junk.write_text("这不是数据库", encoding="utf-8")
+    check("不是数据库的文件被拒绝", inspect_backup(junk) != "")
+
+    # 这一条专门对付「拿别的 sqlite 文件当备份」：它完整性检查是 ok 的，
+    # 只看 integrity_check 会放行，替换之后用户的词库就没了。
+    alien = tmpdir / "alien_backup.db"
+    aconn = sqlite3.connect(alien)
+    aconn.execute("CREATE TABLE unrelated(x)")
+    aconn.commit()
+    aconn.close()
+    alien_reason = inspect_backup(alien)
+    check("完整性 ok 但没有词条表被拒绝", alien_reason != "", alien_reason)
+    check("缺词条表时说清原因", "词条表" in alien_reason, alien_reason)
+
+    broken = tmpdir / "broken_backup.db"
+    raw = fresh_backup.read_bytes()
+    # 刻意只砸第二页：库头与 sqlite_master 还在（表名照样查得出来），
+    # 完整性却过不了。这正是「只查表名、不查 integrity_check」会放行的那一类。
+    # 换个位置砸（比如文件正中）实测毫无效果——那块落在空闲页里，什么检查都过。
+    pconn = sqlite3.connect(f"file:{fresh_backup.as_posix()}?mode=ro", uri=True)
+    page_size = pconn.execute("PRAGMA page_size").fetchone()[0]
+    pconn.close()
+    broken.write_bytes(raw[:page_size] + b"\x00" * page_size + raw[page_size * 2 :])
+    broken_reason = inspect_backup(broken)
+    check("损坏的备份被拒绝", broken_reason != "", broken_reason)
+    check("损坏提示指向完整性", "完整性" in broken_reason, broken_reason)
+
+    # 暂存：复制到目标旁边，备份本身必须留着（用户可能只想拿回几条，或留作存档）。
+    restore_target = tmpdir / "restore_me.db"
+    tconn = connect(restore_target)
+    init_db(tconn)
+    t_repo = Repository(tconn)
+    t_repo.upsert(Entry(lemma="willbeoverwritten", definition_zh="旧库内容"))
+    old_count = t_repo.count()
+    src_count = repo.count()
+
+    raised = False
+    try:
+        stage_restore(junk, restore_target)
+    except sqlite3.DatabaseError:
+        raised = True
+    check("坏备份在复制前就被拦下", raised)
+    check(
+        "坏备份没留下暂存件",
+        not restore_target.with_name(restore_target.name + ".restore").exists(),
+    )
+
+    staged = stage_restore(fresh_backup, restore_target)
+    check(
+        "暂存件落在目标旁边",
+        staged == restore_target.with_name(restore_target.name + ".restore"),
+        str(staged),
+    )
+    # 先判「备份还在」，再比字节数：顺序反过来，一旦暂存把备份搬走（is not 复制），
+    # 上一行就会因为文件不存在抛异常，把这条判据挡在门外，看起来像没写测试。
+    check("暂存不动备份本身", fresh_backup.exists())
+    check(
+        "暂存件与备份字节数一致",
+        fresh_backup.exists()
+        and staged.stat().st_size == fresh_backup.stat().st_size,
+    )
+
+    # 替换：先关连接（Windows 上打开着会锁住文件），再清残留日志。
+    # 留着旧 -wal 等于把旧库的页回放进新库，所以这里先造两个假的出来。
+    tconn.close()
+    for suffix in ("-wal", "-shm"):
+        restore_target.with_name(restore_target.name + suffix).write_bytes(b"stale")
+    replace_with_staged(staged, restore_target)
+    check("替换后暂存件已消失", not staged.exists())
+    check(
+        "替换清掉了残留日志",
+        not restore_target.with_name(restore_target.name + "-wal").exists(),
+    )
+
+    rconn = connect(restore_target)
+    r_repo = Repository(rconn)
+    check(
+        "替换后条目数来自备份",
+        r_repo.count() == src_count and old_count != src_count,
+        f"{r_repo.count()} != {src_count}（旧库 {old_count} 条）",
+    )
+    check("旧库的词条不复存在", r_repo.get("willbeoverwritten") is None)
+    check("新库能查到备份里的词", r_repo.get("ubiquitous") is not None)
+    rconn.close()
 
     # ---- 14. 检索覆盖：例句、例句翻译、备注、标签 ----
     # 生词本是用户自己的本子，「搜不到自己写的备注」是实打实的能力缺失。
@@ -5112,6 +5212,139 @@ def main() -> int:
         )
     except Exception as exc:  # noqa: BLE001
         check("单实例唤醒通道可用", False, str(exc))
+
+    # ---- 本地使用统计 / 授权 / 版本号 ----
+    # 这一块的失败形态同样是「静默」：事件没写进去只是摘要少几条，开关没生效
+    # 只是「关掉了还在记」，版本号写错只有拿到报告的人才看得出来。所以判据都
+    # 打在能读出差别的地方，而且每条都先构造出「不该发生」的那一侧。
+    try:
+        from app import config as cfg_mod
+        from app.core import analytics as ana
+        from app.version import APP_VERSION
+
+        _defaults = dict(cfg_mod.DEFAULT_CONFIG)
+        check(
+            "统计默认关闭且未表态",
+            _defaults.get("analytics_enabled") is False
+            and _defaults.get("analytics_consent_decided") is False,
+            f"enabled={_defaults.get('analytics_enabled')} "
+            f"decided={_defaults.get('analytics_consent_decided')}",
+        )
+        # 漏登记 _COERCERS 的表现是「关掉之后重启又自己打开」——开关形同虚设，
+        # 不报任何错。所以这条不是形式检查。
+        _need = (
+            "analytics_enabled",
+            "analytics_consent_decided",
+            "analytics_schema_version",
+        )
+        _missing = [k for k in _need if k not in cfg_mod._COERCERS]
+        check(
+            "统计字段都在配置校验表里",
+            not _missing,
+            ("缺 " + "、".join(_missing)) if _missing else "三个齐全",
+        )
+
+        # 版本号只有一份定义在 app/version.py，CHANGELOG 是另一份。两处不一致时
+        # 报告里的版本号就失去了对照价值，而这件事没有别的办法发现。
+        _changelog = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
+        _first_version = ""
+        for _line in _changelog.read_text(encoding="utf-8").splitlines():
+            _stripped = _line.strip()
+            if _stripped.startswith("## v"):
+                _first_version = _stripped[3:].strip().split("（")[0].strip()
+                _first_version = _first_version.lstrip("v").strip()
+                break
+        check(
+            "版本常量与 CHANGELOG 首条一致",
+            bool(_first_version) and _first_version == APP_VERSION,
+            f"常量={APP_VERSION!r} CHANGELOG={_first_version!r}",
+        )
+
+        # 配置写入必须原子完成：写到一半坏掉时，读取侧会静默退回默认值，
+        # 用户的「已拒绝统计」选择就丢了，下次启动会重新弹告知页。
+        _atomic_dir = Path(tempfile.mkdtemp(prefix="quill_selfcheck_cfg_"))
+        _saved_app_dir = cfg_mod.APP_DIR
+        _saved_cfg_path = cfg_mod.CONFIG_PATH
+        _saved_ana_path = cfg_mod.ANALYTICS_PATH
+        try:
+            cfg_mod.APP_DIR = _atomic_dir
+            cfg_mod.CONFIG_PATH = _atomic_dir / "config.json"
+            cfg_mod.ANALYTICS_PATH = _atomic_dir / "analytics.db"
+            cfg_mod.save_config({"theme": "night", "analytics_enabled": True})
+            _reloaded = cfg_mod.load_config()
+            _tmp_left = list(_atomic_dir.glob("*.tmp"))
+            check(
+                "配置原子写入且不留临时文件",
+                _reloaded.get("analytics_enabled") is True
+                and _reloaded.get("theme") == "night"
+                and not _tmp_left,
+                f"enabled={_reloaded.get('analytics_enabled')} "
+                f"theme={_reloaded.get('theme')!r} 残留={[p.name for p in _tmp_left]}",
+            )
+
+            # 未授权写入必须为假，而且不该留下库文件。
+            cfg_mod.save_config({"analytics_enabled": False})
+            _wrote_unauthorized = ana.record_event("app_started")
+            check(
+                "未授权时一个事件都不记",
+                _wrote_unauthorized is False and not ana.db_path().exists(),
+                f"写入={_wrote_unauthorized} 库存在={ana.db_path().exists()}",
+            )
+
+            ana.set_enabled(True)
+            _ok_event = ana.record_event(
+                "dictionary_lookup",
+                {"duration_ms": 1234, "success": True, "secret": "不该进来"},
+            )
+            _bad_type = ana.record_event(
+                "dictionary_lookup", {"duration_ms": True, "success": "yes"}
+            )
+            _unknown = ana.record_event("user_typed_the_word")
+            _rows = ana.report_rows(10)
+            _lookup = [r for r in _rows if r["event_name"] == "dictionary_lookup"]
+            # 取「最近一条」会拿到刚写的类型不符那条（属性被清空），所以判据必须
+            # 问「有没有一条带着完整属性」，不能只看第一条——第一版就是这么写错的。
+            _cleaned_set = [r["properties"] for r in _lookup]
+            # 两件事都要判：该在的在（duration_ms / success 原样保留），
+            # 不该在的不在（多传的 secret 必须丢弃）。只判前半句的话，
+            # 白名单整个失效也照样通过——变异测试第一次跑就是这么 MISSED 的。
+            _leaked = [p for p in _cleaned_set if "secret" in p]
+            check(
+                "事件写入且属性经白名单过滤",
+                _ok_event is True
+                and {"duration_ms": 1234, "success": True} in _cleaned_set
+                and not _leaked,
+                f"写入={_ok_event} 属性集={_cleaned_set}",
+            )
+            # 类型不符的属性要被丢掉，但事件本身保留——多传一个坏字段不该让整条消失。
+            check(
+                "属性类型不符即丢弃，事件仍保留",
+                _bad_type is True and len(_lookup) == 2,
+                f"写入={_bad_type} 命中={len(_lookup)} 条",
+            )
+            check("未知事件名被拒绝", _unknown is False, f"写入={_unknown}")
+
+            ana.set_enabled(False)
+            _after_off = ana.record_event("app_started")
+            _total_after_off = ana.total()
+            check(
+                "关闭统计后不再写入",
+                _after_off is False and _total_after_off == 2,
+                f"写入={_after_off} 总数={_total_after_off}",
+            )
+            _cleared = ana.clear()
+            check(
+                "清除只清统计事件",
+                _cleared == 2 and ana.total() == 0 and ana.db_path().exists(),
+                f"清除={_cleared} 剩余={ana.total()}",
+            )
+        finally:
+            cfg_mod.APP_DIR = _saved_app_dir
+            cfg_mod.CONFIG_PATH = _saved_cfg_path
+            cfg_mod.ANALYTICS_PATH = _saved_ana_path
+            shutil.rmtree(_atomic_dir, ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001
+        check("统计默认关闭且未表态", False, str(exc))
 
     conn.close()
 

@@ -18,6 +18,7 @@ import os
 import shutil
 from pathlib import Path
 
+from . import atomic
 from .ui.theme import BG_VEIL_DEFAULT, THEME_DEFAULT, theme_id_of, veil_level
 
 # 软件名。窗口标题、应用名、数据目录、exe 名都从这里派生，避免「同一属性
@@ -35,6 +36,9 @@ APP_DIR = Path(
 CONFIG_PATH = APP_DIR / "config.json"
 KEY_PATH = APP_DIR / "api_key.bin"
 DB_PATH = APP_DIR / "quill.db"
+# 本地使用统计的数据库。**刻意与词库分开**：统计写失败、被锁、被用户删掉，
+# 都不该碰到生词本；反过来，备份或导出词库时也不会把统计数据一起带走。
+ANALYTICS_PATH = APP_DIR / "analytics.db"
 
 # 旧数据目录与旧数据库文件名（迁移用）。它们只在这里定义一份，迁移逻辑与
 # 自检都从这取值，避免「改了一处忘了另一处」。
@@ -83,6 +87,17 @@ DEFAULT_CONFIG: dict = {
     # 比，配置值更小就弹出欢迎页并写回新版本。用版本号而不是 bool 的「看过没有」：
     # 教程大改后递增，老用户也能看到新版。
     "onboard_version": 0,
+    # ---- 本地使用统计 ----
+    # 三个字段一起读才成立：
+    #   analytics_consent_decided 记「用户是否明确选过」，没选过就还要弹告知页；
+    #   analytics_enabled 记「现在是否记录」，用户可以选了参与之后再关掉。
+    # 两者不能合并成 bool：否则「关掉统计」与「还没问过」无法区分，关掉之后
+    # 每次启动都会重新弹告知页。
+    # 默认全关：未告知之前不得开始记录。
+    "analytics_enabled": False,
+    "analytics_consent_decided": False,
+    # 统计数据结构版本。事件表结构变化时 +1，用于报告与旧库兼容判断。
+    "analytics_schema_version": 1,
 }
 
 # 接入模式白名单。写在这里而不是散落在 UI 与 provider 里，避免各判一套。
@@ -210,6 +225,9 @@ _COERCERS: dict = {
     "background_recent": _coerce_recent,
     "theme": _coerce_theme,
     "onboard_version": _coerce_int,
+    "analytics_enabled": _coerce_bool,
+    "analytics_consent_decided": _coerce_bool,
+    "analytics_schema_version": _coerce_int,
     # 必须登记在这里。save_config() 只保存 _COERCERS 里出现过的字段，
     # 漏登记的表现是「在设置里关掉兜底、重启后又自己打开了」——
     # 开关形同虚设，而且不会报任何错。
@@ -247,7 +265,13 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """写入配置。只保存已知字段，且只保存通过校验的值。"""
+    """写入配置。只保存已知字段，且只保存通过校验的值。
+
+    落盘走 `atomic.write_text`（同目录 .tmp → os.replace），不是直接 write_text。
+    配置里现在存着「用户已同意统计」「用户已拒绝统计」这类**必须留存**的选择：
+    写一半坏掉时，读取侧会静默退回默认值，用户的选择就丢了，下次启动还会重新
+    弹一遍告知页——看起来像程序没记住，实际是文件被写坏了。
+    """
     ensure_dir()
     merged = dict(DEFAULT_CONFIG)
     if isinstance(cfg, dict):
@@ -256,8 +280,8 @@ def save_config(cfg: dict) -> None:
                 value = coerce(cfg[key])
                 if value is not None:
                     merged[key] = value
-    CONFIG_PATH.write_text(
-        json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
+    atomic.write_text(
+        CONFIG_PATH, json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 

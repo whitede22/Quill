@@ -16,18 +16,22 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..config import KEY_PATH, check_config
+from ..core import analytics, report
 from ..providers import offline_dict_status, resolve_offline_dict
 from ..providers.openai_compat import OpenAICompatProvider
 from ..security.keystore import IS_WINDOWS, save_api_key
 from .background import BackgroundRenderer
+from .consent import ConsentDialog
 from .hotkey import HOTKEY_TEXT
 from .hotkey import available as hotkey_available
+from .report_dialog import ReportDialog
 from .theme import (
     BG_VEIL_DEFAULT,
     THEME_DEFAULT,
@@ -70,11 +74,16 @@ class SettingsDialog(QDialog):
         api_key: str,
         parent=None,
         on_theme_preview=None,
+        on_restore=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setMinimumWidth(460)
         self._config = dict(config)
+        # 「从备份恢复」需要一个能关闭数据库连接的地方，而那只有 main 有。
+        # 回调为 None 时（自检、截图脚本）不显示这个按钮，而不是显示一个点了
+        # 只报错的按钮。
+        self._on_restore = on_restore
         # 主题即时预览用的回调，由主窗口注入。默认 None 时退化成「保存后才生效」，
         # 这样自检 / 截图脚本沿用旧调用方式也不会坏。
         self._on_theme_preview = on_theme_preview
@@ -162,6 +171,34 @@ class SettingsDialog(QDialog):
             self.tray.setText("关闭窗口后留在托盘（仅 Windows 支持全局热键）")
             self.tray.setToolTip("当前平台没有系统级热键，关闭窗口即退出程序。")
 
+        # ---- 使用统计与反馈 ----
+        # 开关和「删除统计」摆在一起：用户判断不了「到底记了什么」，但看得懂
+        # 「有多少条、能不能删掉」。摘要与报告把前半句补上。
+        self.analytics = QCheckBox("在这台电脑上记录使用情况（不上传）")
+        self.analytics.setChecked(bool(config.get("analytics_enabled", False)))
+        self.analytics.setToolTip(
+            "只记功能使用次数与耗时，不记生词、释义、笔记、剪贴板内容和密钥。\n"
+            "数据存在本机，不会自动发送；想提交报告得自己点「提交报告」。"
+        )
+
+        self.analytics_row = QWidget()
+        stat_layout = QHBoxLayout(self.analytics_row)
+        stat_layout.setContentsMargins(0, 0, 0, 0)
+        stat_layout.setSpacing(6)
+        for text, slot, tip in (
+            ("查看摘要", self._show_summary, "这台电脑到目前为止记了多少条、都是哪几类。"),
+            ("导出报告", self._export_report, "存成 JSON，位置由你选；文件里有什么会先列出来。"),
+            ("提交报告", self._submit_report, "存到本机并打开 GitHub 提交页，附件要自己拖进去。"),
+            ("删除统计", self._clear_stats, "只删统计数据，词库、笔记、复习进度不受影响。"),
+            ("隐私说明", self._show_privacy, "重新看一遍记录范围与用途。"),
+        ):
+            button = QPushButton(text)
+            button.setObjectName("bare")
+            button.setToolTip(tip)
+            button.clicked.connect(slot)
+            stat_layout.addWidget(button)
+        stat_layout.addStretch(1)
+
         # 离线词库的规模直接摆在设置里：用户要先知道「本地这本词典有多少词」，
         # 才能判断该不该切过去，而不是切过去发现查不到再生疑。
         offline = resolve_offline_dict()
@@ -182,6 +219,16 @@ class SettingsDialog(QDialog):
         )
         storage.setObjectName("muted")
         storage.setWordWrap(True)
+
+        # 备份按钮在主工具栏，恢复放这里：恢复会覆盖数据，不该和「备份」并排
+        # 摆成一个手快点错的位置。
+        self.btn_restore = QPushButton("从备份恢复…")
+        self.btn_restore.setObjectName("bare")
+        self.btn_restore.setToolTip(
+            "用一份 .db 备份覆盖当前生词本。覆盖前会自动把当前数据另存一份。"
+        )
+        self.btn_restore.clicked.connect(self._restore_backup)
+        self.btn_restore.setVisible(on_restore is not None)
 
         # 校验提示：就地显示在对话框里，不弹窗——弹窗会把对话框关掉，
         # 用户还得重新填一遍
@@ -210,9 +257,12 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(self.fallback)
         layout.addWidget(self.tray)
+        layout.addWidget(self.analytics)
+        layout.addWidget(self.analytics_row)
         layout.addWidget(hint)
         layout.addWidget(offline_hint)
         layout.addWidget(storage)
+        layout.addWidget(self.btn_restore)
         layout.addWidget(self.btn_tutorial)
         layout.addWidget(self._probe_note)
         layout.addWidget(self._error)
@@ -222,6 +272,81 @@ class SettingsDialog(QDialog):
         self.btn_test.clicked.connect(self._test_connection)
         self.mode.currentIndexChanged.connect(self._sync_enabled)
         self._sync_enabled()
+
+    # ---------- 使用统计与反馈 ----------
+
+    def _current_theme(self) -> str:
+        """对话框里当前选中的主题。统计这几个弹窗跟设置同色，不另起一套。"""
+        return self.theme.currentData() or self._theme_original
+
+    def _show_summary(self) -> None:
+        payload = report.build_report(30)
+        lines = report.summary_lines(payload)
+        if not payload.get("event_total"):
+            lines.append("")
+            lines.append(
+                "还没有记录到事件。统计关闭时不会记录；刚打开的话，"
+                "用几个功能再回来看就有数字了。"
+            )
+        QMessageBox.information(self, "使用统计", "\n".join(lines))
+
+    def _export_report(self) -> None:
+        payload = report.build_report(30)
+        dialog = ReportDialog(self._current_theme(), payload, self, mode="save")
+        if dialog.exec() and dialog.saved_path:
+            QMessageBox.information(
+                self, "使用报告", f"已保存到：\n{dialog.saved_path}"
+            )
+
+    def _submit_report(self) -> None:
+        # 提交是第二个独立决定：统计开着也不代表愿意发出去，所以这里不默认放行。
+        if not self.analytics.isChecked():
+            QMessageBox.information(
+                self,
+                "提交使用报告",
+                "提交之前先勾选「在这台电脑上记录使用情况」。\n"
+                "记录与提交是两个决定，程序不替你合并。",
+            )
+            return
+        payload = report.build_report(30)
+        if not payload.get("event_total"):
+            QMessageBox.information(
+                self, "提交使用报告", "还没有记录到事件，暂时没有可提交的内容。"
+            )
+            return
+        dialog = ReportDialog(self._current_theme(), payload, self, mode="submit")
+        if dialog.exec() and dialog.saved_path:
+            QMessageBox.information(
+                self,
+                "提交使用报告",
+                f"报告已保存：\n{dialog.saved_path}\n\n"
+                "浏览器已打开提交页，把 JSON 文件拖进输入框，检查一遍再自己点提交。\n"
+                "程序无法知道你最后有没有发出去，所以这里不写「已提交」。",
+            )
+
+    def _clear_stats(self) -> None:
+        if not analytics.total():
+            QMessageBox.information(self, "删除统计", "本机还没有统计数据。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除统计",
+            "删除本机记录的全部使用统计？\n\n"
+            "词库、笔记、复习进度存在另一个文件里，不会被删。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        removed = analytics.clear()
+        QMessageBox.information(self, "删除统计", f"已删除 {removed} 条记录。")
+
+    def _show_privacy(self) -> None:
+        ConsentDialog(self._current_theme(), self, review_only=True).exec()
+
+    def _restore_backup(self) -> None:
+        if self._on_restore is not None:
+            self._on_restore()
 
     def _build_theme_row(self, config: dict) -> QWidget:
         """「界面主题」这一行：下拉框（每项带色块）+ 即时生效。
@@ -567,6 +692,12 @@ class SettingsDialog(QDialog):
         self._config["model"] = self.model.text().strip()
         self._config["offline_fallback"] = self.fallback.isChecked()
         self._config["tray_enabled"] = self.tray.isChecked()
+        # 统计开关被改动过，就算用户已经就这件事表过态。否则「在设置里关掉、
+        # 重启后又被问一次要不要参与」——那等于程序没把他的选择当选择。
+        _was_enabled = bool(self._config.get("analytics_enabled", False))
+        self._config["analytics_enabled"] = self.analytics.isChecked()
+        if self.analytics.isChecked() != _was_enabled:
+            self._config["analytics_consent_decided"] = True
         self._config["background_image"] = self.background.text().strip()
         self._config["background_blur"] = self.bg_blur.isChecked()
         self._config["background_veil"] = self.bg_veil.currentData() or BG_VEIL_DEFAULT

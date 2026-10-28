@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from ..config import (
     load_config,
     save_config,
 )
+from ..core import analytics
 from ..core.db import backup_to
 from ..core.dictionary import DictionaryService
 from ..core.exporter import (
@@ -260,6 +262,18 @@ class MainWindow(QMainWindow):
         self._hotkey: GlobalHotkey | None = None
         self._tray_hinted = False
 
+        # 统计用的一次性状态。三类信息都只在「刚发生的那一次操作」里有意义：
+        #   起点时间（算耗时）、是否失败（算成功率）、来源（手动还是剪贴板）。
+        # 放在窗口上而不是参数里传：回调是异步的，经 submit 绕一圈回来时
+        # 已经没有调用栈可以带参数了。
+        self._lookup_started = 0.0
+        self._lookup_failed = False
+        self._op_name = "lookup"
+        self._pending_source = "manual"
+        # 备份恢复要关掉 main 里那个连接才能替换文件，所以具体流程由 main 注入。
+        # 为 None 时（自检、截图脚本直接构造窗口）按钮不出现。
+        self.restore_hook = None
+
         self.setWindowTitle("Quill · 英语生词本")
         self.resize(1080, 700)
         self.setMinimumSize(760, 520)
@@ -283,7 +297,7 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         # 首次启动（或教程升级后）弹出欢迎页。用 singleShot 延后到事件循环：
         # 窗口要先 show() 出来，弹窗才有正确的父级与层级。
-        QTimer.singleShot(0, self._maybe_show_onboarding)
+        QTimer.singleShot(0, self._maybe_show_first_run)
 
     # ---------- 托盘与全局热键 ----------
 
@@ -431,6 +445,9 @@ class MainWindow(QMainWindow):
         self.input.setText(seed)
         self.input.selectAll()
         self.input.setFocus()
+        # 这一次查词是从剪贴板来的。统计里区分手输与剪贴板，是为了知道热键
+        # 到底有没有人用——这是判断「这个功能值不值得留」的唯一依据。
+        self._pending_source = "clipboard"
 
     def _maybe_show_onboarding(self) -> None:
         """教程版本号落后于当前版本时，弹出欢迎页并写回新版本。
@@ -446,6 +463,34 @@ class MainWindow(QMainWindow):
         dialog = OnboardingDialog(self._theme, parent=self)
         dialog.exec()
         self.config["onboard_version"] = CURRENT_ONBOARD_VERSION
+        save_config(self.config)
+
+    def _maybe_show_first_run(self) -> None:
+        """首启的两页按固定顺序弹：先欢迎页，后统计告知。
+
+        两个都是模态框，必须串行。同时弹两个的结果是后者压住前者，用户关掉上面
+        那个才发现底下还有一个；在没有窗口系统的环境里，则表现为整个进程卡在
+        `exec()` 上，且不报错。
+        """
+        self._maybe_show_onboarding()
+        self._maybe_show_consent()
+
+    def _maybe_show_consent(self) -> None:
+        """用户还没就本地统计表过态时问一次。
+
+        **关掉窗口不算表态**：`choice` 仍是 None，配置不写，下次启动再问。
+        把「无视弹窗」当成同意，是这类功能最容易越界的地方。
+        """
+        from .consent import ConsentDialog
+
+        if bool(self.config.get("analytics_consent_decided", False)):
+            return
+        dialog = ConsentDialog(self._theme, parent=self)
+        dialog.exec()
+        if dialog.choice is None:
+            return
+        self.config["analytics_enabled"] = bool(dialog.choice)
+        self.config["analytics_consent_decided"] = True
         save_config(self.config)
 
     # ---------- 背景图 ----------
@@ -951,8 +996,20 @@ class MainWindow(QMainWindow):
         用户可能带着未保存的编辑进会话，出来后那条编辑的落库时机就悬了。
         """
         self._flush_edits()
+        started = time.monotonic()
         dialog = ReviewDialog(self.repo, self._theme, parent=self)
         dialog.exec()
+        # 时长含「打开但一个都没评」的整段停留时间，所以只有真评过才记：
+        # 记了没评的那次，会把「平均一轮复习多久」拉得毫无意义。
+        graded = dialog.graded()
+        if graded:
+            analytics.record_event(
+                "review_completed",
+                {
+                    "count": int(graded),
+                    "duration_ms": int(max(0.0, time.monotonic() - started) * 1000),
+                },
+            )
         # 会话里评过分，到期集合变了，按钮上的数字要跟着刷新。
         self._refresh_review_count()
 
@@ -1309,6 +1366,7 @@ class MainWindow(QMainWindow):
     def _lookup_word(self, word: str) -> None:
         # 查询会切换当前词条，压在内存里的备注先落盘，否则会丢
         self._flush_edits()
+        self._begin_timing("lookup")
         seq = self._next_seq()
         self._set_busy(True, f"正在查询「{word}」…")
         submit(
@@ -1347,6 +1405,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "查询词组", reason)
             return
         self._flush_edits()
+        self._begin_timing("phrase")
         seq = self._next_seq()
         self._set_busy(True, f"正在查询词组「{text}」…")
         submit(
@@ -1423,12 +1482,45 @@ class MainWindow(QMainWindow):
     def _finish_content(self, seq: int) -> None:
         if self._is_current(seq):
             self._set_busy(False)
+            self._record_lookup()
         # 否则说明还有更新的请求在飞，忙碌态由它负责解除
+
+    def _begin_timing(self, op: str) -> None:
+        """记下这次操作的起点与名字。
+
+        只留耗时与成败：统计不关心用户查的是哪个词，那是他最私人的东西之一。
+        """
+        self._lookup_started = time.monotonic()
+        self._lookup_failed = False
+        self._op_name = op
+
+    def _record_lookup(self) -> None:
+        """收尾时补一条查词事件。
+
+        没有起点就不记：批量重查走的是 `service.refresh`，它不经过
+        `_begin_timing`，而「重查」和「查词」在报告里是两件事。
+        """
+        started = self._lookup_started
+        if not started:
+            return
+        self._lookup_started = 0.0
+        duration = int(max(0.0, time.monotonic() - started) * 1000)
+        analytics.record_event(
+            "dictionary_lookup",
+            {"duration_ms": duration, "success": not self._lookup_failed},
+        )
 
     def _on_lookup_ok(self, result, seq: int) -> None:
         if not self._is_current(seq):
             return
         entry, cached = result
+        # 没走缓存说明这次真的写了库。来源区分手输与剪贴板，用来判断热键有没有人用。
+        # 词是什么不进统计——报告里只需要「新增了几个」。
+        if not cached:
+            analytics.record_event(
+                "word_added", {"source_type": self._pending_source}
+            )
+        self._pending_source = "manual"
         self._present_entry(entry, self._origin_of(entry, cached))
 
     @staticmethod
@@ -1494,6 +1586,10 @@ class MainWindow(QMainWindow):
         # 为一次过期的失败弹窗只会造成困惑
         if not self._is_current(seq):
             return
+        # 统计只记「哪一类操作失败了」，不记异常文本：异常里常带绝对路径、
+        # 用户输入的词、甚至接口返回的片段。
+        self._lookup_failed = True
+        analytics.record_event("app_error", {"error_code": f"{self._op_name}_failed"})
         self.statusBar().showMessage("查询失败")
         QMessageBox.warning(self, "查询失败", message)
 
@@ -2237,6 +2333,20 @@ class MainWindow(QMainWindow):
 
         self._reload_list(select_id=self._focus_after_import())
         self._report_import()
+        # 统计只留「这一批进了几条、有没有半路停下」，不留导入了哪些词。
+        # 放进条数而不是文件名：文件名常带日期、书名甚至人名。
+        _added = len(self._import_outcome.added) + len(
+            self._import_outcome.phrases_added
+        )
+        analytics.record_event(
+            "import_completed",
+            {
+                "count": _added,
+                "success": not (
+                    self._import_outcome.cancelled or bool(self._import_error)
+                ),
+            },
+        )
         # 报告读完这一轮的计数之后把它们清干净。窗口不会为下一次导入重建，这些
         # 字段会一直挂着上一轮的数字——任何读它们的地方（调试、日志、将来的功能）
         # 都会把旧数字当成这一轮的结果。`_import_outcome` 刻意留着：它承载的是
@@ -2513,6 +2623,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法导出 PDF", str(exc))
             return
 
+        # 格式与条数足够判断「哪种导出真有人用」，路径与文件名不进统计。
+        analytics.record_event(
+            "export_completed", {"format": key, "count": len(entries)}
+        )
         self.statusBar().showMessage(f"已导出 {len(entries)} 条")
         scope = "（当前筛选结果）" if query else ""
         extra = ""
@@ -2599,6 +2713,63 @@ class MainWindow(QMainWindow):
 
     # ---------- 设置 ----------
 
+    def _restore_from_backup(self) -> None:
+        """从备份恢复：选文件 → 校验 → 二次确认 → 交给 main 里的替换流程。
+
+        校验放在问「确定吗」之前：让用户先为一份坏文件紧张一次，再告诉他
+        「这份用不了」，是多余的惊吓。
+
+        恢复完成后**主动退出**，不在运行中热切数据库。连接、FTS 索引、
+        列表缓存、详情区全都指向旧文件，要「切完继续用」就得把每一层重建
+        一遍，漏掉任何一处都会变成「看起来恢复了，其实还在写旧库」。
+        """
+        from ..core.db import inspect_backup
+
+        hook = self.restore_hook
+        if hook is None:
+            self.statusBar().showMessage("恢复功能不可用：没有拿到数据库连接")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择备份文件", str(APP_DIR), "Quill 备份 (*.db);;所有文件 (*)"
+        )
+        if not path:
+            return
+        backup = Path(path)
+        problem = inspect_backup(backup)
+        if problem:
+            QMessageBox.warning(
+                self, "无法恢复", f"这份备份不可用：{problem}\n\n当前数据没有被改动。"
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "从备份恢复",
+            "将用这份备份覆盖当前生词本。\n\n"
+            "覆盖前会先把当前数据另存一份，但覆盖之后，词条、备注、"
+            "复习进度都以后者为准。继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            guard = hook(backup)
+        except Exception as exc:  # noqa: BLE001 - 文件锁、权限、坏库都要如实说
+            QMessageBox.critical(
+                self, "恢复失败", f"{exc}\n\n当前数据没有被改动。"
+            )
+            return
+        QMessageBox.information(
+            self,
+            "恢复完成",
+            f"已从备份恢复。程序会退出，请重新打开。\n\n"
+            f"替换前的那份数据另存为：\n{guard}",
+        )
+        self._quitting = True
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
     def _open_settings(self) -> None:
         # 主题走即时预览：配色是**看着挑**的，若要先保存再看效果，用户得在设置
         # 与主窗口之间来回跑。取消时对话框会把主题还原（见 SettingsDialog.reject）。
@@ -2607,6 +2778,7 @@ class MainWindow(QMainWindow):
             load_api_key(KEY_PATH),
             self,
             on_theme_preview=self._apply_theme,
+            on_restore=self._restore_from_backup,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

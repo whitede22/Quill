@@ -681,7 +681,7 @@ from app.core.dictionary import DictionaryService
 from app.providers.mock import MockProvider
 from app.ui.theme import stylesheet
 from app.ui.main_window import MainWindow
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 app.setStyleSheet(stylesheet())
@@ -714,7 +714,7 @@ from app.core.dictionary import DictionaryService
 from app.providers.mock import MockProvider
 from app.ui.theme import stylesheet
 from app.ui.main_window import MainWindow
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 app.setStyleSheet(stylesheet())
@@ -750,7 +750,7 @@ from app.core.repository import Repository
 from app.core.dictionary import DictionaryService
 from app.providers.mock import MockProvider
 from app.ui.main_window import MainWindow
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 w = MainWindow(repo, DictionaryService(repo, MockProvider()), config); w.show()
@@ -782,7 +782,7 @@ from app.core.dictionary import DictionaryService
 from app.providers.mock import MockProvider
 from app.ui.main_window import MainWindow
 from app.ui.settings import SettingsDialog
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 w = MainWindow(repo, DictionaryService(repo, MockProvider()), config); w.show()
@@ -813,7 +813,7 @@ from app.core.dictionary import DictionaryService
 from app.providers.mock import MockProvider
 import app.ui.main_window as mw
 from app.ui.main_window import MainWindow
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 w = MainWindow(repo, DictionaryService(repo, MockProvider()), config); w.show()
@@ -876,7 +876,7 @@ from app.core.dictionary import DictionaryService
 from app.core.models import Entry, Synonym
 from app.providers.mock import MockProvider
 from app.ui.main_window import MainWindow
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 w = MainWindow(repo, DictionaryService(repo, MockProvider()), config); w.show()
@@ -918,7 +918,7 @@ from app.core.dictionary import DictionaryService
 from app.core.models import Entry
 from app.providers.mock import MockProvider
 from app.ui.main_window import MainWindow
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 w = MainWindow(repo, DictionaryService(repo, MockProvider()), config); w.show()
@@ -1047,7 +1047,7 @@ from app.core.models import Entry
 from app.providers.mock import MockProvider
 from app.ui.theme import stylesheet
 from app.ui.main_window import MainWindow
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 app.setStyleSheet(stylesheet())
@@ -1372,7 +1372,7 @@ from app.core.dictionary import DictionaryService
 from app.providers.mock import MockProvider
 from app.ui.theme import stylesheet
 from app.ui.main_window import MainWindow
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 app.setStyleSheet(stylesheet())
@@ -1418,7 +1418,7 @@ def strip_delta(image, y, x0, x1):
         prev = cur
     return best
 
-from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV
+from app.ui.onboarding import CURRENT_ONBOARD_VERSION as _CV; config = load_config(); config['provider'] = 'mock'; config['onboard_version'] = _CV; config['analytics_consent_decided'] = True
 conn = connect(tmp/'t.db'); init_db(conn)
 repo = Repository(conn)
 app.setStyleSheet(stylesheet())
