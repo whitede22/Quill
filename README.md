@@ -4,7 +4,7 @@
 
 生词都在自己电脑上的一个 `.db` 文件里，拷走就带走。换台机器不会什么都不剩。
 
-v1.2.0（2026-10-27）：内置词库换成 ECDICT 全量档（76.9 万词），新增托盘常驻与 `Alt+Q` 全局热键。[下载免安装版](https://github.com/whitede22/Quill/releases/latest) · [更新记录](https://github.com/whitede22/Quill/blob/main/CHANGELOG.md)
+v1.3.0（2026-10-28）：新增本地使用统计（默认关闭、可随时删）、从备份恢复、复习第四档与学习摘要。[下载免安装版](https://github.com/whitede22/Quill/releases/latest) · [更新记录](https://github.com/whitede22/Quill/blob/main/CHANGELOG.md)
 
 ## 界面预览
 

@@ -359,7 +359,6 @@ ABLATIONS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "A27 Anki 制表符导出",
-        "Anki 制表符导出",
         "把生词接进 Anki 的记忆流程。抽走后导出对话框少一种，"
         "想要的路由不存在——但其余六种**一切照常**，没有任何地方会提这件事",
         "app/ui/export_dialog.py",
