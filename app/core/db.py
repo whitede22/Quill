@@ -303,9 +303,20 @@ def strip_cjk(text: str) -> str:
 
 
 def connect(db_path: Path | str) -> sqlite3.Connection:
+    """打开一条数据库连接。
+
+    **连接不跨线程复用**：`check_same_thread` 用默认的 True。这里曾经写的是
+    False，配合「后台任务直接拿主线程的 Repository」的写法，两个线程就在同
+    一条连接上提交事务。CPython 的 sqlite3 是 serialized 编译（实测
+    `threadsafety == 3`），所以它不崩、不抛错，只是 A 线程的 commit 会把
+    B 线程写了一半的事务一并提交。出了问题是「某几条词条莫名进了库」或
+    「某条更新丢了」，没有任何报错可循。
+
+    后台任务要读库，走 `Repository.clone()` 另开一条，不要放宽这个参数。
+    """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

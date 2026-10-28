@@ -5,11 +5,13 @@ from __future__ import annotations
 import re
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 from .db import (
     _CJK_RE,
     FTS_COLUMNS,
     FTS_WEIGHTS,
+    connect,
     fts_values,
     has_fts,
     strip_cjk,
@@ -107,11 +109,52 @@ def build_fts_query(raw: str) -> str:
     return " AND ".join(clauses)
 
 
+def _conn_db_path(conn: sqlite3.Connection) -> Path | None:
+    """从连接本身问出库文件路径。
+
+    不新增构造参数是有意的：`Repository(conn)` 的调用点散在主程序、自检、
+    冒烟、消融各处，只要有一处忘了传路径，那条路径上的后台任务就会静默退回
+    共用主连接——而这正是要消灭的写法。让 SQLite 自己回答（`database_list`
+    的第一行就是主库文件），不存在「调用方记错」的余地。
+
+    内存库的文件名为空串，此处映射成 None，`clone()` 据此拒绝：另开一条连接
+    拿到的是另一个空库，给它一条「连得上但什么都没有」的连接，比直接报错更
+    难查。
+    """
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if row[1] == "main":
+                return Path(row[2]) if row[2] else None
+    except sqlite3.Error:
+        return None
+    return None
+
+
 class Repository:
     """所有数据库读写都经由本类，UI 层不直接接触 SQL。"""
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
+        self.db_path = _conn_db_path(conn)
+
+    def clone(self) -> Repository:
+        """为当前线程另开一条连接，返回指向同一个库的新仓储。
+
+        后台任务（查词、重新查询、导入）一律走这个入口。主线程那条连接有线程
+        归属，worker 里直接用它会在 CPython 上抛 ProgrammingError；而把
+        `check_same_thread` 放宽成 False 换来的是「不报错但事务互相踩」。
+
+        新连接是独立事务边界：调用方写完后必须自己 commit（仓储的写方法都已
+        自行提交），用完 `close()`。克隆不复制任何状态，两个实例之间除库文件
+        外没有其他联系。
+        """
+        if self.db_path is None:
+            raise RuntimeError("这条连接没有对应的库文件，无法为其他线程另开连接")
+        return Repository(connect(self.db_path))
+
+    def close(self) -> None:
+        """关闭底层连接。只用于 `clone()` 出来的临时仓储。"""
+        self.conn.close()
 
     def upsert(self, entry: Entry) -> Entry:
         """写入词条；已存在的同 lemma 词条按其 id 覆盖全部内容字段。

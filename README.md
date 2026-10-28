@@ -200,11 +200,11 @@ app/
   security/keystore.py DPAPI 封装
   ui/                  主窗口、详情面板、主题、线程、设置、背景图与全局热键
 scripts/
-  selfcheck.py         数据层自检（605 项）
+  selfcheck.py         数据层自检（614 项）
   gui_smoke.py         GUI 交互冒烟（285 项）
   http_smoke.py        HTTP 链路端到端（54 项）
   lock_check.py        单实例锁（跨进程）
-  mutation_check.py    变异测试（170 项）
+  mutation_check.py    变异测试（174 项）
   ablation_check.py    消融实验（33 项）
   prove_checks.py      自证脚本（15 条）
   check_trim.py        裁剪依赖校验
