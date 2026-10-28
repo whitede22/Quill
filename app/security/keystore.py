@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import base64
 import ctypes
-import os
 import sys
 from ctypes import wintypes
+
+from ..atomic import write_text as atomic_write_text
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -98,22 +99,15 @@ else:
 def save_api_key(path, api_key: str) -> None:
     """保存密钥。清空即删除文件。
 
-    写入走「同目录 .tmp → os.replace」的原子替换，与 db.backup_to 同一范式：
-    直接 write_text 到目标路径时，中途失败会留下一段**半截密文**，而
+    写入走 `atomic.write_text`（同目录 .tmp → os.replace），与 `db.backup_to` 同一
+    范式：直接 write_text 到目标路径时，中途失败会留下一段**半截密文**，而
     load_api_key 解不开就静默返回空串——用户看到「未填写密钥」，完全不知道
     是被写坏的，还得重填一次。密钥文件很小，多这一步几乎不花时间。
     """
     if not api_key:
         path.unlink(missing_ok=True)
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    try:
-        tmp.write_text(encrypt_text(api_key), encoding="ascii")
-        os.replace(tmp, path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write_text(path, encrypt_text(api_key), encoding="ascii")
 
 
 def load_api_key(path) -> str:

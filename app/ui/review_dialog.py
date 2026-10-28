@@ -32,11 +32,12 @@ from ..core.models import Entry
 from ..core.repository import Repository
 from .theme import stylesheet
 
-# 三档评分按钮：(文案, grade)。顺序即 FORGOT / FUZZY / REMEMBERED。
+# 四档评分按钮：(文案, grade)。顺序即 FORGOT / FUZZY / REMEMBERED / EASY。
 _GRADE_BUTTONS = (
     ("忘了", review.FORGOT),
     ("模糊", review.FUZZY),
     ("记住了", review.REMEMBERED),
+    ("太简单", review.EASY),
 )
 
 
@@ -250,20 +251,30 @@ class ReviewDialog(QDialog):
 
     def _render_done(self) -> None:
         self._progress.setText("")
+        # 末尾附一行全库摘要：用户刚做完一轮，正是想「我整体到什么程度了」的时候。
+        # 口径与「数据不足」的说法都在 review_stats 里，界面不另写一套。
+        from ..core.review_stats import summary_text
+
+        library_note = summary_text(self.repo.conn)
         if self._queue:
             head = QLabel("本轮复习完成")
             head.setObjectName("reviewLemma")
             head.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._body_layout.addStretch(1)
             self._body_layout.addWidget(head)
-            note = QLabel(f"共复习 {self._graded} 个词。被评「忘了」的词会尽快再出现。")
+            note = QLabel(
+                f"共复习 {self._graded} 个词。被评「忘了」的词会尽快再出现。\n"
+                f"{library_note}"
+            )
         else:
             head = QLabel("今天没有到期的词")
             head.setObjectName("reviewLemma")
             head.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._body_layout.addStretch(1)
             self._body_layout.addWidget(head)
-            note = QLabel("查词即自动进入复习计划，到期的词会出现在这里。")
+            note = QLabel(
+                f"查词即自动进入复习计划，到期的词会出现在这里。\n{library_note}"
+            )
         note.setObjectName("reviewHint")
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         note.setWordWrap(True)
