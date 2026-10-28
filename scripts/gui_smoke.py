@@ -52,7 +52,7 @@ def _clean_home() -> None:
 atexit.register(_clean_home)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QMimeData, QPointF, QSize, Qt, QTimer, QUrl  # noqa: E402
+from PySide6.QtCore import QEventLoop, QMimeData, QPointF, QRect, QSize, Qt, QTimer, QUrl  # noqa: E402
 from PySide6.QtGui import QColor, QDropEvent, QImage, QPainter, QPalette  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
@@ -1307,6 +1307,16 @@ def main() -> int:
             results["重查前备注未落盘"] = "无当前词条，跳过"
 
     def check_refresh() -> None:
+        # 重查是异步的，固定排期（4200ms）只保证「通常够」。实测偶发不足：读到的
+        # 还是「正在重新查询…」，断言按失败处理，看起来像回调接错了，其实只是
+        # 还没跑完。等到状态栏不再显示那条进行中的文案；超时就把当时的实际内容
+        # 留给断言，红也红得有信息。
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "正在重新查询" not in window.statusBar().currentMessage():
+                break
+            app.processEvents()
+            time.sleep(0.01)
         lemma = refresh_target.get("lemma")
         saved = repo.get(lemma) if lemma else None
         results["重查后备注仍在"] = bool(
@@ -1499,9 +1509,9 @@ def main() -> int:
         results["删除他人后仍选中原条"] = bool(
             selected is not None and int(selected.data(Qt.ItemDataRole.UserRole)) == kept_id
         )
-        # 这里**不** app.quit()：后面还有导入阶段要跑。退出只交给最后一个阶段；
-        # 中间任何一处提前退出，都会让后面的观测变成「未采集到」——那看起来
-        # 像那些用例失败了，其实根本没跑过。
+        # 这里**不** app.quit()：后面还有导入阶段要跑。退出由 `_guard` 在阶段
+        # 清单全部跑过之后统一触发；中间任何一处提前退出，都会让后面的观测变成
+        # 「未采集到」——那看起来像那些用例失败了，其实根本没跑过。
 
     def import_check() -> None:
         """一键导入：真读文件 → 真解析 → 真写库 → 真报告。
@@ -1853,7 +1863,9 @@ def main() -> int:
             results["单词表带着真实词条与中文释义"] = "\t" in wl_text
         print(f"  INFO  导出落盘：成功={written} pdf说明={pdf_note or '(无)'}", flush=True)
 
-        app.quit()
+        # 退出不在这里。原先这里直接 `app.quit()`，它一旦抢在其他阶段前面执行，
+        # 那些阶段的观测就变成「未采集到该观测」。现在由 `_guard` 在阶段清单全部
+        # 跑过之后统一退出，这个函数只管把自己这一段做完。
 
     def polish_check() -> None:
         """界面层级的样式接线：工具栏三级、chip 等宽、底部操作收拢、下拉框宽度。
@@ -2063,7 +2075,17 @@ def main() -> int:
         for theme_id in theme_mod.theme_ids():
             window._apply_theme(theme_id)
             settle()
-            shades.append(window.grab().toImage().pixelColor(8, 6).getRgb()[:3])
+            # 只抓左上角一小块。不带参数的 `grab()` 会把整个窗口渲染一遍，六套主题
+            # 就是六次全量渲染，实测占掉 16.4 秒；而这里只需要 (8, 6) 一个点。
+            # 那 16 秒把 `new_features` 之后的四个阶段挤出了退出窗口，症状是
+            # 它们全部「未采集到该观测」，看起来像那几个功能坏了。采样区不能
+            # 小于被读的坐标，否则 `pixelColor` 落在图外。
+            shades.append(
+                window.grab(QRect(0, 0, 16, 12))
+                .toImage()
+                .pixelColor(8, 6)
+                .getRgb()[:3]
+            )
             accents.append(
                 window.btn_query.palette().color(QPalette.ColorRole.Button).name()
             )
@@ -3661,7 +3683,36 @@ def main() -> int:
 
     # 阶段串行的闸门。见 _guard 里的说明——阶段内部会 processEvents()，
     # 那会把**已经到期的定时器**一并派发，于是后一个阶段在前一个阶段内部重入。
-    running = {"active": False}
+    running = {"active": False, "done": set()}
+
+    # 必须跑完的阶段清单，退出条件由它决定，不再靠「最后一个阶段自己 quit」。
+    #
+    # 原先 `import_check` 结尾直接 `app.quit()`。它一抢到闸门就退出进程，而排在
+    # 它后面、或已在排队等闸门的阶段再也不会执行，判定循环看到的是「未采集到该
+    # 观测」。2026-10-28 用计时打印量过：`new_features_check` 14.2 秒、`theme_check`
+    # 16.4 秒，两者合计就顶穿了当时的固定排期，三次连跑分别丢 22、28、50 项，而
+    # 干净基线同一份脚本也丢 20、22、1 项，说明是退出条件本身不可靠，不是某次
+    # 改动引入。改成「清单里每个阶段都跑过才退」，排期只决定先后，不决定生死。
+    _stage_fns = [
+        do_lookup,
+        verify,
+        finalize,
+        check_refresh,
+        race_check,
+        fallback_check,
+        card_check,
+        polish_check,
+        background_check,
+        theme_check,
+        welcome_check,
+        review_check,
+        analytics_check,
+        new_features_check,
+        tray_hotkey_check,
+        collocation_check,
+        surface_check,
+        import_check,
+    ]
 
     def _guard(stage):
         """把每个阶段包起来：抛异常也要变成一条显式失败并收尾。
@@ -3690,6 +3741,11 @@ def main() -> int:
                 app.quit()
             finally:
                 running["active"] = False
+                running["done"].add(stage)
+                if len(running["done"]) >= len(_stage_fns):
+                    # 全部阶段都跑过才退出。给 200ms 让最后一条断言把结果写进
+                    # `results`，再走判定循环。
+                    QTimer.singleShot(200, app.quit)
 
         return _run
 
@@ -3748,15 +3804,18 @@ def main() -> int:
     QTimer.singleShot(14000, _guard(collocation_check))
     # 底座场景排在最后一批：它会临时把应用调色板换成深色再换回来，必须独占
     # 一个没有别的阶段在跑的时间窗（串行闸门能保证不并发，这里给的是足够晚
-    # 的起点）。放在 import_check（26000 且会 quit）之前。
+    # 的起点）。放在 import_check（36000 且会 quit）之前。
     QTimer.singleShot(25000, _guard(surface_check))
     # 导入是最后一个阶段，它在结尾 app.quit()。串行闸门靠「60ms 一次」的重试排队，
-    # 无法保证「14000ms 的 collocation 一定比 17000ms 的 import 先拿到执行权」——
-    # 一旦 import 抢先在 collocation 之前跑完并 quit，collocation 的 30 项观测
-    # 就变成「未采集到」，而且偶发（实测 198/0 与 168/30 交替出现）。所以 import
-    # 必须晚到「new_features（最坏约 8s）+ collocation（最坏约 3s）」都必然结束
-    # 之后，给 collocation 一个不受挤压的时间窗。
-    QTimer.singleShot(26000, _guard(import_check))
+    # 无法保证「14000ms 的 collocation 一定比更晚的 import 先拿到执行权」。一旦
+    # import 抢先跑完并 quit，collocation 的 30 项观测就变成「未采集到」，而且偶发。
+    #
+    # 排期按**实测**算，不按估算。此前这里写 26000，注释里的预算是「new_features
+    # 最坏约 8s」，实测却是 14.2s，加上 collocation 与 surface 就顶穿了退出窗口：
+    # 2026-10-28 三次连跑分别丢 22、28、50 项，而干净基线同一份脚本也丢 20、22、1
+    # 项，说明是预算错而不是某次改动坏掉。给计时打印量过各阶段耗时后改成 36000，
+    # 留出 new_features 14.2 + collocation 约 3 + surface 约 0.1 的余量。
+    QTimer.singleShot(36000, _guard(import_check))
     app.exec()
     conn.close()
 
