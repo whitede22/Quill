@@ -1820,6 +1820,40 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         "scripts/gui_smoke.py",
         "未勾选记录时拒绝提交报告",
     ),
+    (
+        # 索引少了行也不管：症状是「部分词搜不到」，而 search() 在 FTS 结果为空时
+        # 会回退 LIKE，所以「全空」反而还能搜到。只有部分缺失那种才真丢结果，
+        # 也最难发现。
+        "init_db 不再检查索引与主表的条数",
+        "app/core/db.py",
+        "        elif not fts_in_sync(conn):\n"
+        "            # 列集对得上，但条数对不上：上次的 DROP 建了一半就断了，或索引里留着\n"
+        "            # 已删词条的残行。列集检查看不见这一类，必须单独查一次。\n"
+        "            rebuild_fts(conn)\n",
+        "        elif False:\n"
+        "            pass\n",
+        "scripts/selfcheck.py",
+        "条数不符时自动重建索引",
+    ),
+    (
+        # 失败后不回滚：DROP 留在未提交事务里，连接一旦被下一次 commit 带上，
+        # 就是一个真正空掉的索引，而 has_fts 只认表名。
+        "init_db 失败后不回滚",
+        "app/core/db.py",
+        "        conn.rollback()\n        raise",
+        "        raise",
+        "scripts/selfcheck.py",
+        "重建失败后索引回到故障前状态",
+    ),
+    (
+        # 一律重建：启动时白跑一遍全量索引，词多了就是明显的启动卡顿。
+        "init_db 无条件重建索引",
+        "app/core/db.py",
+        "        elif not fts_in_sync(conn):\n",
+        "        else:\n",
+        "scripts/selfcheck.py",
+        "结构正确时不重建索引",
+    ),
 ]
 
 

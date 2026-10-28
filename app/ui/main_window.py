@@ -40,7 +40,7 @@ from ..config import (
     save_config,
 )
 from ..core import analytics
-from ..core.db import backup_to
+from ..core.db import backup_to, rebuild_fts
 from ..core.dictionary import DictionaryService
 from ..core.exporter import (
     PdfFontUnavailable,
@@ -2713,6 +2713,24 @@ class MainWindow(QMainWindow):
 
     # ---------- 设置 ----------
 
+    def _rebuild_search_index(self) -> int:
+        """按当前词条重建全文索引，返回索引条数。供设置页那个按钮调用。
+
+        事务边界收在这一处：成功才提交，失败先回滚再往上抛。不做回滚的话，
+        连接会停在未提交状态，下一次任意 `commit()` 都会把 DROP 之后的半成品
+        一并写下去，这正是「索引没了但程序不报错」的成因。
+
+        重建后不需要刷新列表与详情区：索引只参与搜索召回，不参与它们的取数。
+        """
+        try:
+            count = rebuild_fts(self.repo.conn)
+            self.repo.conn.commit()
+        except Exception:
+            self.repo.conn.rollback()
+            raise
+        self.statusBar().showMessage(f"搜索索引已重建：{count} 条")
+        return count
+
     def _restore_from_backup(self) -> None:
         """从备份恢复：选文件 → 校验 → 二次确认 → 交给 main 里的替换流程。
 
@@ -2779,6 +2797,7 @@ class MainWindow(QMainWindow):
             self,
             on_theme_preview=self._apply_theme,
             on_restore=self._restore_from_backup,
+            on_rebuild_index=self._rebuild_search_index,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

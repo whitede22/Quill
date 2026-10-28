@@ -637,6 +637,9 @@ EXPECT: dict = {
     "托盘开关可用": True,
     "托盘开关默认勾上": True,
     "托盘开关如实反映配置": True,
+    "无回调时隐藏重建索引按钮": True,
+    "有回调时显示重建索引按钮": True,
+    "重建索引按钮就地显示结果": True,
     # 离线词条说「待重查」，接口词条仍说「来源 接口」——两条成对，
     # 只测一条的话，把标签写死成「离线待重查」也能通过
     "接口来源标签仍写来源": "来源 接口",
@@ -1157,6 +1160,20 @@ def main() -> int:
             window,
         )
         results["托盘开关如实反映配置"] = not _tray_off_dialog.tray.isChecked()
+
+        # 重建搜索索引。与「从备份恢复」同一个规矩：主窗口没给回调时（自检、
+        # 截图脚本）隐藏按钮，而不是摆一个点了没反应的。两个方向都要断言，
+        # 否则「按钮永远是隐藏的」也能通过。
+        results["无回调时隐藏重建索引按钮"] = offline.btn_rebuild_index.isHidden()
+        _rb_dialog = SettingsDialog(
+            {"provider": "mock", "base_url": "", "model": ""},
+            "",
+            window,
+            on_rebuild_index=lambda: 7,
+        )
+        results["有回调时显示重建索引按钮"] = not _rb_dialog.btn_rebuild_index.isHidden()
+        _rb_dialog.btn_rebuild_index.click()
+        results["重建索引按钮就地显示结果"] = "7" in _rb_dialog._rebuild_note.text()
 
         # 词库文件不在时，兜底开关必须置灰——`build_provider()` 找不到词库就
         # 直接不挂兜底，留着可勾选等于在界面上撒谎。这条分支在本机不会自然
