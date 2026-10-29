@@ -98,6 +98,39 @@ def _sample_background(path: Path) -> None:
     image.save(str(path))
 
 
+def _sanitize_settings_paths(dialog) -> None:
+    """把设置页里的本机绝对路径换成示例路径。
+
+    设置页有两处直接显示绝对路径。窗口背景的输入框指向本次渲染用的临时目录
+    （`%TEMP%\\quill_shot_xxx\\wallpaper.png`），「本地词库」那行的位置指向
+    开发机上的仓库。预览图要进 README，这两处等于把本机的目录结构一并公开。
+
+    只改显示文字，不改取值：背景输入框在截图那一刻才换字，预览条已经按真实
+    文件算好，因此图仍是真图。
+    """
+    from PySide6.QtWidgets import QLabel
+
+    dialog.background.blockSignals(True)
+    dialog.background.setText(r"C:\Users\you\Pictures\wallpaper.png")
+    dialog.background.blockSignals(False)
+
+    # 下拉框停在占位项上时，画面会出现「背景已填、最近使用却写着没用过」的
+    # 自相矛盾。选中那条记录，文案才与输入框对得上。
+    if dialog.bg_recent.count() > 1:
+        dialog.bg_recent.blockSignals(True)
+        dialog.bg_recent.setCurrentIndex(1)
+        dialog.bg_recent.blockSignals(False)
+
+    for label in dialog.findChildren(QLabel):
+        text = label.text()
+        if not text.startswith("本地词库："):
+            continue
+        head = text.split("\n", 1)[0]
+        label.setText(
+            head + "\n位置：" + r"C:\Program Files\Quill\assets\offline_dict.db"
+        )
+
+
 def main() -> int:
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else (
         Path(__file__).resolve().parents[1] / "preview.png"
@@ -207,6 +240,7 @@ def main() -> int:
             )
             dialog.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
             dialog.show()
+            _sanitize_settings_paths(dialog)
             dialog._on_save()
             QTimer.singleShot(180, lambda: (dialog.grab().save(str(out)), app.quit()))
             return
