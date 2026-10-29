@@ -20,6 +20,8 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
+from ..core import errors
+
 # 正在执行中的任务。仅用于「持有引用」，保证投递完成前对象不被回收。
 _ACTIVE: set["Worker"] = set()
 _ACTIVE_LOCK = threading.Lock()
@@ -27,7 +29,10 @@ _ACTIVE_LOCK = threading.Lock()
 
 class WorkerSignals(QObject):
     succeeded = Signal(object)
-    failed = Signal(str)
+    # 两个参数：给用户看的那句话，以及给统计用的失败类别。类别在后台线程里
+    # 现算，因为只有那里还拿着异常对象；到主线程只剩一句话，判不出是超时
+    # 还是限流。
+    failed = Signal(str, str)
     finished = Signal()
 
 
@@ -45,7 +50,9 @@ class Worker(QRunnable):
         try:
             result = self._fn(*self._args, **self._kwargs)
         except Exception as exc:  # noqa: BLE001 - 需把任何异常传回 UI
-            self.signals.failed.emit(str(exc) or exc.__class__.__name__)
+            self.signals.failed.emit(
+                str(exc) or exc.__class__.__name__, errors.classify(exc)
+            )
         else:
             self.signals.succeeded.emit(result)
         finally:
@@ -56,7 +63,7 @@ def submit(
     fn: Callable[..., Any],
     *args: Any,
     on_success: Callable[[Any], None] | None = None,
-    on_error: Callable[[str], None] | None = None,
+    on_error: Callable[[str, str], None] | None = None,
     on_finished: Callable[[], None] | None = None,
     **kwargs: Any,
 ) -> Worker:

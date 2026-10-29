@@ -56,6 +56,14 @@ class ReviewDialog(QDialog):
         self._queue: list[Entry] = repo.due_entries(review.format_timestamp(self._now))
         self._index = 0
         self._graded = 0
+        # 四档各评了几条。SM-2 的间隔与难度系数只能靠这份分布来调：
+        # 只知道「评了 20 条」时，全评「记住了」和半数「忘了」看起来一模一样。
+        self._ratings: dict[int, int] = {
+            review.FORGOT: 0,
+            review.FUZZY: 0,
+            review.REMEMBERED: 0,
+            review.EASY: 0,
+        }
         self._revealed = False
         # 三个状态各自建不同的按钮，统一在 __init__ 置初值，避免测试在「完成态」
         # 去摸「翻面按钮」这种不存在的引用。
@@ -111,6 +119,20 @@ class ReviewDialog(QDialog):
     @property
     def graded(self) -> int:
         return self._graded
+
+    def ratings(self) -> dict[str, int]:
+        """四档各评了几条，键名与统计白名单一致。
+
+        返回新字典而不是内部计数器：调用方拿它去记统计，不该顺手把计数改掉。
+        键名在这里定，是因为四档按钮也在这里——两处分头起名，报告里就会
+        同时出现 `forgot` 与 `again`。
+        """
+        return {
+            "forgot": self._ratings[review.FORGOT],
+            "fuzzy": self._ratings[review.FUZZY],
+            "remembered": self._ratings[review.REMEMBERED],
+            "easy": self._ratings[review.EASY],
+        }
 
     @property
     def revealed(self) -> bool:
@@ -300,6 +322,10 @@ class ReviewDialog(QDialog):
             return
         self._repo.apply_review(entry.id, grade, self._now)
         self._graded += 1
+        # 认不出的档位不记，也不新建键：统计的取值集合是固定的四档，
+        # 多一个键写进报告就是多一个要归一化的脏值。
+        if grade in self._ratings:
+            self._ratings[grade] += 1
         self._index += 1
         self._revealed = False
         self._render()

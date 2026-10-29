@@ -102,7 +102,9 @@ DEFAULT_CONFIG: dict = {
     "analytics_enabled": False,
     "analytics_consent_decided": False,
     # 统计数据结构版本。事件表结构变化时 +1，用于报告与旧库兼容判断。
-    "analytics_schema_version": 1,
+    # 报告里报的是 `analytics.SCHEMA_VERSION`，不是这里——这一项留着是配置
+    # 结构的一部分，改它不影响报告写什么。
+    "analytics_schema_version": 2,
     # 提交报告时的署名，空表示还没填过。只为了下次不用重输，它不进统计、
     # 也不参与任何别的判断——删掉这一行等于清空预填，没有其他后果。
     "report_name": "",

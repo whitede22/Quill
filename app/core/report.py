@@ -44,11 +44,21 @@ MAX_EVENTS = 1000
 MAX_SUBMITTER = 20
 MAX_NOTE = 150
 
+# 摘要的行数上限与单行字数上限。中转函数对这两条都有硬判定，超出整份退回，
+# 用户看到的只是「服务端没认这份报告」。客户端多写一行就撞上，所以在这里
+# 留一份同一口径，自检拿最坏情况（署名、备注、七类计数、截断提示全在）核对。
+SUMMARY_MAX_LINES = 12
+SUMMARY_MAX_CHARS = 200
+
 # 报告里明确写出「有什么、没有什么」，用户在看预览时不必翻代码。
 _INCLUDES = (
     "功能使用次数（查词、复习、导入、导出、启动）",
     "每次操作的耗时区间与成功与否",
-    "出错时的预定义编号",
+    "查词走的是接口、离线词库还是兜底，以及是否命中本地缓存",
+    "复习时四档评分各评了几条",
+    "出错时的类别（超时、网络、鉴权、限流等）与操作名",
+    "生词本规模所在区间、每次启动的耗时",
+    "每次启动随机生成的会话号，只用于把同一次打开里的操作归在一起",
     "Quill 版本与统计数据结构版本",
 )
 _EXCLUDES = (
@@ -74,9 +84,9 @@ def build_report(days: int = 30, *, now: datetime | None = None) -> dict:
     return {
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "quill_version": APP_VERSION,
-        "analytics_schema_version": int(
-            config.load_config().get("analytics_schema_version", 1)
-        ),
+        # 报代码里的表结构版本，不读配置里那个同名字段：那个字段只在默认值里
+        # 出现过一次，升级后也不会跟着变，读它等于让每份新报告都写着一个旧数字。
+        "analytics_schema_version": analytics.SCHEMA_VERSION,
         "generated_at": stamp,
         "period_days": days,
         "event_total": summary["total"],
@@ -84,6 +94,7 @@ def build_report(days: int = 30, *, now: datetime | None = None) -> dict:
         "events_truncated": summary["total"] > len(events),
         "by_event": summary["by_event"],
         "by_day": [{"date": d, "count": n} for d, n in summary["by_day"]],
+        "session_total": summary.get("sessions", 0),
         "first_event_utc": summary["first_ts"],
         "last_event_utc": summary["last_ts"],
         "privacy": {"includes": list(_INCLUDES), "excludes": list(_EXCLUDES)},
@@ -161,9 +172,61 @@ def summary_lines(payload: dict) -> list[str]:
     if by_event:
         detail = "、".join(f"{name} {count}" for name, count in sorted(by_event.items()))
         lines.append(f"分类计数：{detail}")
+    if payload.get("session_total"):
+        lines.append(f"打开次数：{payload['session_total']}")
+    lookup = _lookup_line(payload.get("events") or [])
+    if lookup:
+        lines.append(lookup)
     if payload.get("events_truncated"):
         lines.append(f"明细已截断：只保留最近 {payload.get('event_count', 0)} 条")
     return lines
+
+
+# 查词来源的中文名。键与统计白名单的 `provider_kind` 取值一一对应。
+_KIND_LABELS = {"online": "接口", "offline": "离线词库", "fallback": "兜底"}
+
+
+def _lookup_line(events: list[dict]) -> str:
+    """把查词按来源分开算一行，回答「慢在哪条路上」。
+
+    两条路的耗时不混在一起算：接口慢是网络和服务商的事，离线慢是首次加载
+    索引的事，平均成一个数之后两种问题都看不出来。附件里有明细，但读邮件的
+    人不会去翻上千条事件，这一行是给他看的。
+    """
+    rows = [
+        (event.get("properties") or {})
+        for event in events
+        if event.get("event_name") == "dictionary_lookup"
+    ]
+    if not rows:
+        return ""
+    parts = []
+    for kind, label in _KIND_LABELS.items():
+        picked = [
+            int(row.get("duration_ms", 0))
+            for row in rows
+            if row.get("provider_kind") == kind
+        ]
+        if not picked:
+            continue
+        parts.append(f"{label} {len(picked)} 次、中位 {_median(picked)} ms")
+    cached = sum(1 for row in rows if row.get("cached") is True)
+    if cached:
+        parts.append(f"命中缓存 {cached} 次")
+    failure = sum(1 for row in rows if row.get("success") is False)
+    if failure:
+        parts.append(f"失败 {failure} 次")
+    if not parts:
+        # 老版本的报告没有 provider_kind，只有次数与耗时。这种情况不硬编一行
+        # 假的来源分布，直接不写——写「接口 0 次」比不写更误导。
+        return ""
+    return "查词：" + "，".join(parts)
+
+
+def _median(values: list[int]) -> int:
+    """中位数取偏大的那个。样本量往往个位数，取平均会被一次冷启动拉偏。"""
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
 
 
 def issue_url(payload: dict) -> str:

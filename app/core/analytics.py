@@ -12,6 +12,9 @@
 4. **不记内容**。没有任何自由文本字段：没有生词、释义、备注、例句、剪贴板、
    密钥、异常原文、绝对路径。想加字段必须先改进本文件的白名单，而白名单只收
    枚举与计数。
+5. **会话号不是身份**。每次启动生成一个八位随机值（`session_id()`），只用来
+   把同一次打开里的操作归到一起。它不来自硬件、不与上一次关联、不写进配置；
+   用户删掉统计库它就没了。它随事件一起落在本机库里，因为不落盘就没法分组。
 
 存储刻意放在独立文件 `analytics.db`，而不是往 `quill.db` 加表：统计写失败、
 库被锁、用户删掉这个文件，都不该碰到生词本；备份与导出词库时也不会把统计
@@ -22,15 +25,19 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import config
 from ..version import APP_VERSION
+from .errors import CLASSES as _ERROR_CLASSES
 
 # 事件表结构版本。加列或改语义时 +1，报告里会带上它，便于旧报告仍可解析。
-SCHEMA_VERSION = 1
+# v2：加 session_id 列；查词加来源与缓存标记；复习加四档评分计数；
+#     启动加耗时与词库规模分档；错误从笼统的「某操作失败」改成有限类别。
+SCHEMA_VERSION = 2
 
 _MAX_PROPERTIES = 8
 _MAX_NAME_LEN = 32
@@ -48,30 +55,77 @@ _FLAG = "flag"
 _SOURCE = "source_type"
 _CODE = "error_code"
 _FORMAT = "format"
+_PROVIDER = "provider_kind"
+_BUCKET = "vocab_bucket"
+_OP = "op"
 
-_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _FORMAT_RE = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
+
+# 枚举型属性：值必须落在给定集合里，多一个就丢掉。换名或加值时只改这里，
+# 否则同一列在报告里会读出第四种写法，分析时得先做一次归一化。
+_ENUMS: dict[str, frozenset[str]] = {
+    # 这次查词真正用的是哪条路。判「是不是兜底」只能看 fallback_reason，
+    # 兜底词条的 source 也是 offline，与用户主动选离线完全同值。
+    _PROVIDER: frozenset({"online", "offline", "fallback"}),
+    # 生词本规模分档。要分档是因为「有人攒到几百词吗」这个结论只需要量级，
+    # 精确条数除了多记一个数没有别的用处。
+    _BUCKET: frozenset({"0", "1-49", "50-199", "200+"}),
+    _OP: frozenset({"lookup", "phrase", "refresh", "import", "export", "report"}),
+    # 错误类别。原先记的是「某操作 failed」，一个操作一个值，读不出失败原因。
+    # 取值表在 `core/errors.py`，那边负责归类，这边只负责校验值在那张表里。
+    _CODE: frozenset(_ERROR_CLASSES),
+}
 
 # 事件白名单。只收**真实存在**的业务动作，不为凑数编造事件。
 EVENTS: dict[str, dict[str, str]] = {
-    # 启动一次。用来看「装了之后有没有再打开」。
-    "app_started": {},
+    # 启动一次。startup_ms 是进程启动到窗口显示；vocab_bucket 看有没有人
+    # 真攒到几百词——这个数决定复习模块还值不值得继续投入。
+    "app_started": {"startup_ms": _DURATION, "vocab_bucket": _BUCKET},
     # 查词一次。duration_ms 是从发起到拿到结果（含兜底）的时长。
-    "dictionary_lookup": {"duration_ms": _DURATION, "success": _FLAG},
+    # provider_kind 与 cached 是给「四秒卡在哪一环」准备的：没有这两项，
+    # 慢只能记成慢，分不出是接口、离线首次加载还是根本没查库。
+    "dictionary_lookup": {
+        "duration_ms": _DURATION,
+        "success": _FLAG,
+        "provider_kind": _PROVIDER,
+        "cached": _FLAG,
+    },
     # 新增一个词条。source_type 区分手输、导入、剪贴板。
     "word_added": {"source_type": _SOURCE},
-    # 复习完一轮。
-    "review_completed": {"count": _COUNT, "duration_ms": _DURATION},
+    # 复习完一轮。四档计数是 SM-2 参数的唯一依据：只知道「评了几条」，
+    # 调不了间隔与难度系数。
+    "review_completed": {
+        "count": _COUNT,
+        "duration_ms": _DURATION,
+        "forgot": _COUNT,
+        "fuzzy": _COUNT,
+        "remembered": _COUNT,
+        "easy": _COUNT,
+    },
     # 导入收尾。count 是实际写库条数，不含跳过。
     "import_completed": {"count": _COUNT, "success": _FLAG},
     # 导出收尾。format 是导出格式标识，取值由界面层传入。
     "export_completed": {"format": _FORMAT, "count": _COUNT},
-    # 出错。只记预定义编号，绝不写异常原文（里面常含路径与用户输入）。
-    "app_error": {"error_code": _CODE},
+    # 出错。只记类别与操作名，不写异常原文（里面常含路径与用户输入）。
+    "app_error": {"error_code": _CODE, "op": _OP},
 }
 
 # 写失败的次数。只给自检与状态栏用，不落盘。
 _failures = 0
+
+# 本次进程的会话号。import 时生成一次，之后整个进程不变。
+# 放在模块级而不是每次现取：同一次打开里的所有事件必须归到一组，取两次就会
+# 得到两个号，分组的结论直接失效。
+_SESSION_ID = secrets.token_hex(4)
+
+
+def session_id() -> str:
+    """本次启动的会话号。
+
+    八位十六进制，来自 `secrets`，与硬件、账号、上一次启动都没有关系。
+    它只做一件事：把同一次打开里发生的事件归到一起，好回答「这次打开用了多深」。
+    """
+    return _SESSION_ID
 
 
 def failures() -> int:
@@ -141,6 +195,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             event_name      TEXT    NOT NULL,
             ts_utc          TEXT    NOT NULL,
             app_version     TEXT    NOT NULL,
+            session_id      TEXT    NOT NULL DEFAULT '',
             properties_json TEXT    NOT NULL DEFAULT '{}'
         )
         """
@@ -155,6 +210,26 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
         (str(SCHEMA_VERSION),),
     )
+    _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """把旧结构的库补到当前版本。
+
+    `CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列，所以 v1 的库拿到手就
+    缺 `session_id`。这里按缺失补列，而不是删表重建：统计数据可以丢，但「丢」
+    这件事得由用户决定，不该由一次升级替他做。
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+    if "session_id" not in columns:
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        "UPDATE meta SET value = ?"
+        " WHERE key = 'schema_version' AND CAST(value AS INTEGER) < ?",
+        (str(SCHEMA_VERSION), SCHEMA_VERSION),
+    )
 
 
 # ---------- 校验 ----------
@@ -162,6 +237,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 def _clean_value(kind: str, value: object) -> object | None:
     """按种类校验单个属性值。不合格返回 None（该属性被丢弃）。"""
+    allowed = _ENUMS.get(kind)
+    if allowed is not None:
+        return value if isinstance(value, str) and value in allowed else None
     if kind == _FLAG:
         return value if isinstance(value, bool) else None
     if kind in (_COUNT, _DURATION):
@@ -175,8 +253,6 @@ def _clean_value(kind: str, value: object) -> object | None:
         return None
     if kind == _SOURCE:
         return value if value in SOURCE_TYPES else None
-    if kind == _CODE:
-        return value if isinstance(value, str) and _CODE_RE.fullmatch(value) else None
     if kind == _FORMAT:
         return value if isinstance(value, str) and _FORMAT_RE.fullmatch(value) else None
     return None
@@ -232,9 +308,9 @@ def record_event(event_name: str, properties: dict | None = None) -> bool:
         try:
             _ensure_schema(conn)
             conn.execute(
-                "INSERT INTO events(event_name, ts_utc, app_version, properties_json)"
-                " VALUES(?, ?, ?, ?)",
-                (event_name, stamp, APP_VERSION, payload),
+                "INSERT INTO events(event_name, ts_utc, app_version, session_id,"
+                " properties_json) VALUES(?, ?, ?, ?, ?)",
+                (event_name, stamp, APP_VERSION, _SESSION_ID, payload),
             )
             conn.commit()
         finally:
@@ -278,6 +354,7 @@ def summarize(days: int = 30) -> dict:
         "total": 0,
         "by_event": {},
         "by_day": [],
+        "sessions": 0,
         "first_ts": "",
         "last_ts": "",
         "days": days,
@@ -297,6 +374,12 @@ def summarize(days: int = 30) -> dict:
             span = conn.execute(
                 "SELECT MIN(ts_utc) AS a, MAX(ts_utc) AS b FROM events"
             ).fetchone()
+            # 会话数就是「打开了几次」。旧库里这一列是空串，数出来是 0 而不是
+            # 一个看起来合理的假数——空串本来就不该算成一次打开。
+            sessions = conn.execute(
+                "SELECT COUNT(DISTINCT session_id) AS n FROM events"
+                " WHERE session_id <> ''"
+            ).fetchone()
             # 按**本地日期**分组给人看：库里存 UTC，用户看到的是自己那边的「今天」。
             by_day = [
                 (row["d"], int(row["n"]))
@@ -313,6 +396,7 @@ def summarize(days: int = 30) -> dict:
             "total": sum(by_event.values()),
             "by_event": by_event,
             "by_day": by_day,
+            "sessions": int(sessions["n"]) if sessions else 0,
             "first_ts": (span["a"] or "") if span else "",
             "last_ts": (span["b"] or "") if span else "",
             "days": days,
@@ -345,8 +429,9 @@ def clear() -> int:
 def report_rows(limit: int = 2000) -> list[dict]:
     """取最近 `limit` 条事件，供报告导出。
 
-    每条只含白名单字段：事件名、时间、版本、属性 JSON（已过滤）。不返回主键，
-    主键会暴露「本机一共记了多少条」以外的顺序信息，对分析没有价值。
+    每条只含白名单字段：事件名、时间、版本、会话号、属性 JSON（已过滤）。
+    不返回主键，主键会暴露「本机一共记了多少条」以外的顺序信息，对分析没有
+    价值。会话号是随机的，同一次打开里的事件共用它。
     """
     if not db_path().exists():
         return []
@@ -355,7 +440,7 @@ def report_rows(limit: int = 2000) -> list[dict]:
         try:
             _ensure_schema(conn)
             rows = conn.execute(
-                "SELECT event_name, ts_utc, app_version, properties_json"
+                "SELECT event_name, ts_utc, app_version, session_id, properties_json"
                 " FROM events ORDER BY id DESC LIMIT ?",
                 (max(0, int(limit)),),
             )
@@ -364,6 +449,7 @@ def report_rows(limit: int = 2000) -> list[dict]:
                     "event_name": row["event_name"],
                     "ts_utc": row["ts_utc"],
                     "app_version": row["app_version"],
+                    "session_id": row["session_id"],
                     "properties": json.loads(row["properties_json"] or "{}"),
                 }
                 for row in rows

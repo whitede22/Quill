@@ -545,7 +545,7 @@ class SettingsDialog(QDialog):
             report.submit,
             payload,
             on_success=lambda _: self._report_sent(path),
-            on_error=lambda message: self._report_failed(message, path, payload),
+            on_error=lambda message, kind: self._report_failed(message, path, payload),
             on_finished=self._reset_report_button,
         )
 
@@ -988,7 +988,8 @@ class SettingsDialog(QDialog):
             # 这不是错误，安静收场即可。
             pass
 
-    def _on_probe_fail(self, message: str) -> None:
+    def _on_probe_fail(self, message: str, kind: str = "") -> None:
+        """测试连接失败。类别不进界面——这里只有一种操作，分类对用户没有意义。"""
         try:
             self.btn_test.setText("测试连接")
             self.btn_test.setEnabled(self.mode.currentData() == "openai-compat")

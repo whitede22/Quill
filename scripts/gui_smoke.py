@@ -866,6 +866,8 @@ EXPECT: dict = {
     "未配置地址时先问是否走 GitHub": True,
     "空署名时提交被拦下": True,
     "填了署名才写报告文件": True,
+    "查词事件写入来源与缓存标记": True,
+    "兜底判定只看 fallback_reason": True,
     # 复习模式（review_check）。
     "待复习按钮在生词本模式可见": True,
     "新词进入复习计划（待复习数 +1）": True,
@@ -875,6 +877,7 @@ EXPECT: dict = {
     "复习会话正面先看词不翻面": True,
     "复习会话翻面后给四档评分": lambda v: v == ["忘了", "模糊", "记住了", "太简单"],
     "复习评分推进了记忆状态": True,
+    "四档评分各自计数": True,
     "复习会话评完推进或结束": True,
     # 容器底色（详情区面板 / 对话框）必须由主题给。系统开深色模式时，没有
     # 背景规则的容器会漏出系统色，与主题给的文字色撞成「深字压深底」。
@@ -2547,6 +2550,42 @@ def main() -> int:
         dlg.deleteLater()
         os.environ.pop("QUILL_REPORT_ENDPOINT", None)
 
+        # ⑨ 查词事件带上来源与缓存标记。调的是窗口里真正的写入口 `_record_lookup`，
+        #    不是在测试里另拼一份字典——拼字典只能证明字典长得对，证不了界面
+        #    写进去的是它。
+        import app.core.analytics as ana_mod
+
+        ana_mod.set_enabled(True)
+        total_before = ana_mod.total()
+        window._begin_timing("lookup")
+        window._lookup_kind = "fallback"
+        window._lookup_cached = True
+        window._record_lookup()
+        hit = [
+            r
+            for r in ana_mod.report_rows(5)
+            if r["event_name"] == "dictionary_lookup"
+        ]
+        props = hit[0]["properties"] if hit else {}
+        results["查词事件写入来源与缓存标记"] = (
+            ana_mod.total() == total_before + 1
+            and props.get("provider_kind") == "fallback"
+            and props.get("cached") is True
+            and props.get("success") is True
+            and isinstance(props.get("duration_ms"), int)
+        )
+
+        class _Probe:
+            def __init__(self, source: str, reason: str = "") -> None:
+                self.source = source
+                self.fallback_reason = reason
+
+        results["兜底判定只看 fallback_reason"] = (
+            window._kind_of_entry(_Probe("offline", "接口超时")) == "fallback"
+            and window._kind_of_entry(_Probe("offline")) == "offline"
+            and window._kind_of_entry(_Probe("openai-compat")) == "online"
+        )
+
         # 收尾：把配置恢复成「已表态、关着」，与 main() 开头的基线一致，
         # 后面场景埋点时不会因为上一段测试的残留而改写统计库。
         window.config["analytics_enabled"] = False
@@ -2598,6 +2637,14 @@ def main() -> int:
             repo.get_by_id(before_id).review_count if before_id is not None else None
         )
         dlg._grade(review_mod.REMEMBERED)
+        # 四档分布是调 SM-2 参数的唯一依据：只记「评了几条」的话，全评「记住了」
+        # 和半数「忘了」的会话在记录里长得一模一样。
+        results["四档评分各自计数"] = dlg.ratings() == {
+            "forgot": 0,
+            "fuzzy": 0,
+            "remembered": 1,
+            "easy": 0,
+        }
         after = repo.get_by_id(before_id) if before_id is not None else None
         results["复习评分推进了记忆状态"] = bool(
             after is not None

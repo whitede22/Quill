@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +36,11 @@ from .ui.main_window import MainWindow
 from .ui.theme import stylesheet
 
 LOCK_PATH = APP_DIR / "quill.lock"
+
+# 启动计时的起点。取在本模块 import 时，也就是进程刚起来、窗口还没建的那一
+# 刻——**不含**解释器与 PyInstaller 引导的那段。这段前缀在启动总耗时里不算小，
+# 但只有把计时器埋进引导器才量得到，而那个代价大于它带来的精度。
+_STARTED = time.monotonic()
 
 # 「把已经开着的那个窗口叫出来」的本地通道名。改名字等于改变协议，
 # 版本号后缀让新旧两版同时存在时不会互相误解。
@@ -152,6 +158,27 @@ def acquire_instance_lock():
     return _InstanceLock(fd)
 
 
+def _vocab_bucket(conn) -> str:
+    """生词本规模落在哪一档。
+
+    分档而不是精确条数：要回答的是「有没有人真的攒到几百词」，这决定复习模块
+    还值不值得继续投入；精确数字除了多记一个数没有别的用处。数不出来时报 0 档，
+    统计是附加物，不该因为一次计数失败拖垮启动。
+    """
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM entries").fetchone()
+        total = int(row[0]) if row else 0
+    except Exception:  # noqa: BLE001 - 统计失败不致命
+        return "0"
+    if total <= 0:
+        return "0"
+    if total < 50:
+        return "1-49"
+    if total < 200:
+        return "50-199"
+    return "200+"
+
+
 def main() -> int:
     migrate_legacy_home()
     ensure_dir()
@@ -213,7 +240,14 @@ def main() -> int:
 
     # 启动事件放在窗口建好之后：第一次启动时用户还没表态，这次不记；
     # 之后每次启动记一条，用来看「装了之后有没有再打开」。
-    analytics.record_event("app_started")
+    # 顺带记两样：进程起来到窗口显示花了多久，以及生词本规模落在哪一档。
+    analytics.record_event(
+        "app_started",
+        {
+            "startup_ms": int(max(0.0, time.monotonic() - _STARTED) * 1000),
+            "vocab_bucket": _vocab_bucket(conn),
+        },
+    )
 
     try:
         return app.exec()

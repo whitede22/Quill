@@ -1759,6 +1759,28 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         "未知事件名被拒绝",
     ),
     (
+        # 枚举属性只判「是不是字符串」，不看值在不在表里。这一松，报告里会出现
+        # 同一列第四种写法（"接口"、"online"、"ONLINE" 各算一类），做分析时
+        # 得先手工归一次，而归一化的依据已经没了。
+        "analytics 枚举属性不再校验取值",
+        "app/core/analytics.py",
+        "        return value if isinstance(value, str) and value in allowed else None\n",
+        "        return value\n",
+        "scripts/selfcheck.py",
+        "查词来源只认 online/offline/fallback",
+    ),
+    (
+        # 旧库不补列。INSERT 会带着 session_id 去写一张没有这列的表，异常被
+        # 「失败不致命」兜掉——表现是打开旧版本积累的统计后，事件一条不再增加，
+        # 而界面上一切正常。
+        "统计库升级时不补 session_id 列",
+        "app/core/analytics.py",
+        "    _migrate(conn)\n",
+        "    pass  # 变异：不迁移旧库\n",
+        "scripts/selfcheck.py",
+        "旧统计库自动补上 session_id 列",
+    ),
+    (
         # 只看表名、不看完整性：被截断或被写坏的备份同样有 entries 表，
         # 放行之后用户拿它覆盖，词库就没了。
         "db.inspect_backup 不查 integrity_check",

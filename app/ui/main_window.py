@@ -299,6 +299,8 @@ class MainWindow(QMainWindow):
         self._lookup_started = 0.0
         self._lookup_failed = False
         self._op_name = "lookup"
+        self._lookup_kind = "online"
+        self._lookup_cached = False
         self._pending_source = "manual"
         # 备份恢复要关掉 main 里那个连接才能替换文件，所以具体流程由 main 注入。
         # 为 None 时（自检、截图脚本直接构造窗口）按钮不出现。
@@ -1072,6 +1074,10 @@ class MainWindow(QMainWindow):
                 {
                     "count": int(graded),
                     "duration_ms": int(max(0.0, time.monotonic() - started) * 1000),
+                    # 四档分布。没有它就只能知道「评了几条」，调不了 SM-2 的
+                    # 间隔与难度系数——全评「记住了」和半数「忘了」的会话
+                    # 在原来的记录里长得一模一样。
+                    **dialog.ratings(),
                 },
             )
         # 会话里评过分，到期集合变了，按钮上的数字要跟着刷新。
@@ -1482,7 +1488,7 @@ class MainWindow(QMainWindow):
             self._worker_lookup,
             word,
             on_success=lambda result, s=seq: self._on_lookup_ok(result, s),
-            on_error=lambda message, s=seq: self._on_error(message, s),
+            on_error=lambda message, kind, s=seq: self._on_error(message, kind, s),
             on_finished=lambda s=seq: self._finish_content(s),
         )
 
@@ -1521,7 +1527,7 @@ class MainWindow(QMainWindow):
             self._worker_lookup_phrase,
             text,
             on_success=lambda result, s=seq: self._on_phrase_ok(result, s),
-            on_error=lambda message, s=seq: self._on_error(message, s),
+            on_error=lambda message, kind, s=seq: self._on_error(message, kind, s),
             on_finished=lambda s=seq: self._finish_content(s),
         )
 
@@ -1563,6 +1569,10 @@ class MainWindow(QMainWindow):
         # 否则回填时库里根本没有值可保留
         self._flush_edits()
         seq = self._next_seq()
+        # 只改操作名，不走 `_begin_timing`：那条路会设下计时起点，收尾时就会被
+        # 记成一次「查词」。重查与查词在报告里是两件事，混成一件事会让耗时
+        # 平均值同时混进两种完全不同的等待。
+        self._op_name = "refresh"
         self._set_busy(True, f"正在重新查询「{word}」…")
         # 注意：refresh() 返回的是单个 Entry，不是 (entry, cached) 元组，
         # 因此必须走专用回调。两者契约不同，接错会抛 TypeError，
@@ -1571,7 +1581,7 @@ class MainWindow(QMainWindow):
             self._worker_refresh,
             word,
             on_success=lambda entry, s=seq: self._on_refresh_ok(entry, s),
-            on_error=lambda message, s=seq: self._on_error(message, s),
+            on_error=lambda message, kind, s=seq: self._on_error(message, kind, s),
             on_finished=lambda s=seq: self._finish_content(s),
         )
 
@@ -1602,6 +1612,31 @@ class MainWindow(QMainWindow):
         self._lookup_started = time.monotonic()
         self._lookup_failed = False
         self._op_name = op
+        # 请求还没出发，先记下这一趟会走哪条路。失败时拿不到词条，只能靠
+        # 这个预判；成功时再用词条本身的来源覆盖。
+        self._lookup_kind = self._current_provider_kind()
+        self._lookup_cached = False
+
+    def _current_provider_kind(self) -> str:
+        """这一趟会走接口还是离线词库。
+
+        取**真实生效**的 provider，不读 `config["provider"]`：接口模式下没配
+        密钥时，`build_provider()` 会静默退回离线，而配置里仍写着 openai-compat。
+        按配置判的话，报告里会把一批离线查词记成接口查词，两条耗时就再也分不开。
+        """
+        name = str(getattr(self.service.provider, "name", "") or "")
+        return "offline" if name == "offline" else "online"
+
+    @staticmethod
+    def _kind_of_entry(entry) -> str:
+        """按词条定来源：接口、离线、还是接口失败后的兜底。
+
+        兜底必须看 `fallback_reason`，不能看 `source`——兜底词条的 source 也是
+        `offline`，与用户主动选离线完全同值。
+        """
+        if (getattr(entry, "fallback_reason", "") or "").strip():
+            return "fallback"
+        return "offline" if str(getattr(entry, "source", "")) == "offline" else "online"
 
     def _record_lookup(self) -> None:
         """收尾时补一条查词事件。
@@ -1616,13 +1651,21 @@ class MainWindow(QMainWindow):
         duration = int(max(0.0, time.monotonic() - started) * 1000)
         analytics.record_event(
             "dictionary_lookup",
-            {"duration_ms": duration, "success": not self._lookup_failed},
+            {
+                "duration_ms": duration,
+                "success": not self._lookup_failed,
+                "provider_kind": self._lookup_kind,
+                "cached": self._lookup_cached,
+            },
         )
 
     def _on_lookup_ok(self, result, seq: int) -> None:
         if not self._is_current(seq):
             return
         entry, cached = result
+        # 拿到的词条才是这次请求真实的结果，覆盖出发时那个预判。
+        self._lookup_cached = bool(cached)
+        self._lookup_kind = self._kind_of_entry(entry)
         # 没走缓存说明这次真的写了库。来源区分手输与剪贴板，用来判断热键有没有人用。
         # 词是什么不进统计——报告里只需要「新增了几个」。
         if not cached:
@@ -1690,15 +1733,18 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(f"{entry.lemma} — {origin}")
 
-    def _on_error(self, message: str, seq: int) -> None:
+    def _on_error(self, message: str, kind: str, seq: int) -> None:
         # 已被更新的请求取代时静默丢弃：用户已经在等新结果，
         # 为一次过期的失败弹窗只会造成困惑
         if not self._is_current(seq):
             return
-        # 统计只记「哪一类操作失败了」，不记异常文本：异常里常带绝对路径、
-        # 用户输入的词、甚至接口返回的片段。
+        # 统计记两样：失败类别与操作名。异常文本不进统计——里面常带绝对路径、
+        # 用户输入的词、甚至接口返回的片段。类别在后台线程里算好传过来，因为
+        # 到这一层只剩一句话，判不出是超时、限流还是返回格式不对。
         self._lookup_failed = True
-        analytics.record_event("app_error", {"error_code": f"{self._op_name}_failed"})
+        analytics.record_event(
+            "app_error", {"error_code": kind, "op": self._op_name}
+        )
         self.statusBar().showMessage("查询失败")
         QMessageBox.warning(self, "查询失败", message)
 
@@ -1858,7 +1904,7 @@ class MainWindow(QMainWindow):
             lemma,
             accept_fallback=False,
             on_success=self._on_refresh_one_ok,
-            on_error=lambda message, word=lemma: self._on_refresh_one_kept(
+            on_error=lambda message, kind, word=lemma: self._on_refresh_one_kept(
                 message, word
             ),
         )
@@ -2450,12 +2496,15 @@ class MainWindow(QMainWindow):
             progress.setValue(min(self._import_done, self._import_total))
         self._next_import_batch()
 
-    def _on_import_batch_failed(self, message: str) -> None:
+    def _on_import_batch_failed(self, message: str, kind: str) -> None:
         """整批失败——不是某一个词的问题，而是环境级故障。
 
         但**不能因此把已写进去的那些词说成没写**：仍然按真实清单收尾，
         只把这次的问题附在后面。
         """
+        # 导入失败原本只在 import_completed 里留一个 success=False，读不出
+        # 是文件坏了、磁盘满了还是词库被锁。类别在这里补上，操作名固定 import。
+        analytics.record_event("app_error", {"error_code": kind, "op": "import"})
         self._import_queue.clear()
         self._import_error = message
         self._finish_import()

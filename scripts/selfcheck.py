@@ -5774,6 +5774,289 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check("统计默认关闭且未表态", False, str(exc))
 
+    # ---- 统计的第二批字段：错误类别、查词来源、四档评分、会话号 ----
+    # 每一条都先构造「不该进来的那个值」，再判它被丢掉。只判「好值能进来」的话，
+    # 白名单整个失效也照样通过——这个坑第一次写白名单断言时就踩过。
+    try:
+        from app import config as cfg_mod
+        from app.core import analytics as ana2
+        from app.core import errors as err_mod
+        from app.core import report as report_mod
+
+        _v2_dir = Path(tempfile.mkdtemp(prefix="quill_selfcheck_ana2_"))
+        _v2_saved = (cfg_mod.APP_DIR, cfg_mod.CONFIG_PATH, cfg_mod.ANALYTICS_PATH)
+        try:
+            cfg_mod.APP_DIR = _v2_dir
+            cfg_mod.CONFIG_PATH = _v2_dir / "config.json"
+            cfg_mod.ANALYTICS_PATH = _v2_dir / "analytics.db"
+            ana2.set_enabled(True)
+
+            ana2.record_event(
+                "app_error", {"error_code": "lookup_failed", "op": "lookup"}
+            )
+            ana2.record_event("app_error", {"error_code": "timeout", "op": "lookup"})
+            _errs = [
+                r["properties"]
+                for r in ana2.report_rows(10)
+                if r["event_name"] == "app_error"
+            ]
+            check(
+                "错误类别只认枚举，旧的「某操作失败」被丢弃",
+                {"op": "lookup"} in _errs
+                and {"error_code": "timeout", "op": "lookup"} in _errs,
+                str(_errs),
+            )
+
+            ana2.record_event(
+                "dictionary_lookup", {"duration_ms": 12, "provider_kind": "接口"}
+            )
+            ana2.record_event(
+                "dictionary_lookup",
+                {"duration_ms": 34, "provider_kind": "fallback", "cached": True},
+            )
+            _lk = [
+                r["properties"]
+                for r in ana2.report_rows(10)
+                if r["event_name"] == "dictionary_lookup"
+            ]
+            check(
+                "查词来源只认 online/offline/fallback",
+                {"duration_ms": 12} in _lk
+                and {"duration_ms": 34, "provider_kind": "fallback", "cached": True} in _lk,
+                str(_lk),
+            )
+
+            ana2.record_event(
+                "review_completed",
+                {"count": 4, "forgot": 1, "fuzzy": 1, "remembered": 1, "easy": 1},
+            )
+            _rv = [
+                r["properties"]
+                for r in ana2.report_rows(10)
+                if r["event_name"] == "review_completed"
+            ]
+            check(
+                "复习四档计数入库",
+                _rv
+                and set(_rv[0])
+                == {"count", "forgot", "fuzzy", "remembered", "easy"}
+                and _rv[0]["easy"] == 1,
+                str(_rv),
+            )
+
+            ana2.record_event(
+                "app_started", {"startup_ms": 900, "vocab_bucket": "999"}
+            )
+            ana2.record_event(
+                "app_started", {"startup_ms": 900, "vocab_bucket": "200+"}
+            )
+            _st = [
+                r["properties"]
+                for r in ana2.report_rows(10)
+                if r["event_name"] == "app_started"
+            ]
+            check(
+                "生词本规模只认四个分档",
+                {"startup_ms": 900} in _st
+                and {"startup_ms": 900, "vocab_bucket": "200+"} in _st,
+                str(_st),
+            )
+
+            _sid = ana2.session_id()
+            check(
+                "会话号八位十六进制且进程内恒定",
+                _sid == ana2.session_id()
+                and len(_sid) == 8
+                and all(c in "0123456789abcdef" for c in _sid),
+                _sid,
+            )
+            check(
+                "每条事件都带上同一个会话号",
+                {r["session_id"] for r in ana2.report_rows(20)} == {_sid},
+                str({r["session_id"] for r in ana2.report_rows(20)}),
+            )
+
+            # 旧库：v1 的建表语句里没有 session_id，meta 里记的版本是 1。
+            _v1 = _v2_dir / "v1.db"
+            _conn = sqlite3.connect(_v1)
+            _conn.execute(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " event_name TEXT NOT NULL, ts_utc TEXT NOT NULL,"
+                " app_version TEXT NOT NULL,"
+                " properties_json TEXT NOT NULL DEFAULT '{}')"
+            )
+            _conn.execute(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            _conn.execute("INSERT INTO meta VALUES('schema_version', '1')")
+            _conn.execute(
+                "INSERT INTO events(event_name, ts_utc, app_version, properties_json)"
+                " VALUES('app_started', '2026-10-28T10:00:00Z', '1.3.0', '{}')"
+            )
+            _conn.commit()
+            _conn.close()
+
+            cfg_mod.ANALYTICS_PATH = _v1
+            ana2.record_event("app_started", {"startup_ms": 800, "vocab_bucket": "0"})
+
+            def _read_v1(sql: str) -> list:
+                # 每次读写都开新连接、用完就关：Windows 上没关的库文件句柄会
+                # 让收尾的 rmtree 删不掉目录，症状是「临时目录残留」这条红。
+                conn = sqlite3.connect(_v1)
+                try:
+                    return conn.execute(sql).fetchall()
+                finally:
+                    conn.close()
+
+            _cols = [row[1] for row in _read_v1("PRAGMA table_info(events)")]
+            _rows = ana2.report_rows(20)
+            _new_row = [r for r in _rows if r["properties"].get("startup_ms") == 800]
+            _old_row = [r for r in _rows if r["app_version"] == "1.3.0"]
+            check(
+                "旧统计库自动补上 session_id 列",
+                "session_id" in _cols
+                and bool(_new_row)
+                and _new_row[0]["session_id"] == _sid
+                and bool(_old_row)
+                and _old_row[0]["session_id"] == "",
+                f"列={_cols} 新行={_new_row} 旧行={_old_row}",
+            )
+            _meta = dict(_read_v1("SELECT key, value FROM meta"))
+            check(
+                "旧库升级后版本号跟着走",
+                _meta.get("schema_version") == str(ana2.SCHEMA_VERSION),
+                str(_meta),
+            )
+            check(
+                "旧行的空会话号不算一次打开",
+                ana2.summarize(30)["sessions"] == 1,
+                str(ana2.summarize(30)["sessions"]),
+            )
+
+            # 分档的错法一律落在边界上（49/50、199/200），所以判据取边界值，
+            # 不取中间值——只测 10 和 1000 的话，< 与 <= 写反也照样通过。
+            from app.main import _vocab_bucket
+
+            _mem = sqlite3.connect(":memory:")
+            _mem.execute("CREATE TABLE entries (id INTEGER PRIMARY KEY)")
+
+            def _bucket(count: int) -> str:
+                _mem.execute("DELETE FROM entries")
+                for _ in range(count):
+                    _mem.execute("INSERT INTO entries DEFAULT VALUES")
+                return _vocab_bucket(_mem)
+
+            _got = {n: _bucket(n) for n in (0, 1, 49, 50, 199, 200)}
+            _mem.close()
+            check(
+                "生词本规模分档在四个边界上正确",
+                _got
+                == {
+                    0: "0",
+                    1: "1-49",
+                    49: "1-49",
+                    50: "50-199",
+                    199: "50-199",
+                    200: "200+",
+                },
+                str(_got),
+            )
+
+            # 报告里的结构版本取代码常量。配置里塞一个旧值，看报告会不会跟着它走。
+            cfg_mod.save_config({"analytics_schema_version": 1})
+            _rep = report_mod.build_report(30)
+            check(
+                "报告的结构版本取代码常量，不跟配置走",
+                _rep["analytics_schema_version"] == ana2.SCHEMA_VERSION
+                and _rep["session_total"] == 1,
+                f"版本={_rep['analytics_schema_version']} 会话={_rep['session_total']}",
+            )
+
+            _line = report_mod._lookup_line(
+                [
+                    {
+                        "event_name": "dictionary_lookup",
+                        "properties": {"provider_kind": "online", "duration_ms": 100},
+                    },
+                    {
+                        "event_name": "dictionary_lookup",
+                        "properties": {"provider_kind": "online", "duration_ms": 300},
+                    },
+                    {
+                        "event_name": "dictionary_lookup",
+                        "properties": {"provider_kind": "offline", "duration_ms": 4000},
+                    },
+                ]
+            )
+            check(
+                "查词摘要按来源分开算",
+                "接口 2 次、中位 300 ms" in _line
+                and "离线词库 1 次、中位 4000 ms" in _line,
+                _line,
+            )
+            _bare = report_mod._lookup_line(
+                [
+                    {
+                        "event_name": "dictionary_lookup",
+                        "properties": {"duration_ms": 5},
+                    }
+                ]
+            )
+            check(
+                "没有来源字段时不硬编一行假的分布",
+                _bare == "",
+                repr(_bare),
+            )
+
+            # 摘要的行数与单行字数都有服务端上限，超了整份退回，而界面只说一句
+            # 「服务端没认这份报告」。按最坏情况拼一份：署名、备注、七类计数、
+            # 打开次数、查词行、截断提示全在。
+            _worst = {
+                "submitter": "名" * report_mod.MAX_SUBMITTER,
+                "note": "字" * report_mod.MAX_NOTE,
+                "quill_version": "1.3.5",
+                "generated_at": "2026-10-29 21:00",
+                "period_days": 30,
+                "event_total": 4000,
+                "event_count": 1000,
+                "events_truncated": True,
+                "by_event": {f"event_{i}": i * 137 for i in range(7)},
+                "session_total": 123,
+                "events": [
+                    {
+                        "event_name": "dictionary_lookup",
+                        "properties": {
+                            "provider_kind": "fallback",
+                            "duration_ms": 12345,
+                            "cached": True,
+                            "success": False,
+                        },
+                    }
+                ],
+            }
+            _worst_lines = report_mod.summary_lines(_worst)
+            _longest = max(len(x) for x in _worst_lines)
+            check(
+                "摘要不超过服务端允许的行数与单行字数",
+                len(_worst_lines) <= report_mod.SUMMARY_MAX_LINES
+                and _longest <= report_mod.SUMMARY_MAX_CHARS,
+                f"行数={len(_worst_lines)} 最长={_longest}",
+            )
+
+            # 分类器本身：类别集合与白名单必须是同一份，否则报告里会出现
+            # 统计层认得、白名单却丢掉的空值。
+            check(
+                "错误类别表与统计白名单一致",
+                set(err_mod.CLASSES) == set(ana2._ENUMS["error_code"]),
+                str(set(err_mod.CLASSES) ^ set(ana2._ENUMS["error_code"])),
+            )
+        finally:
+            cfg_mod.APP_DIR, cfg_mod.CONFIG_PATH, cfg_mod.ANALYTICS_PATH = _v2_saved
+            shutil.rmtree(_v2_dir, ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001
+        check("统计第二批字段", False, str(exc))
+
+
     # ---- 提交报告时的署名与备注 ----
     # 判据挑两处：截断（服务端对摘要单行有 200 字上限，超了整份退回）与
     # 「空署名不留空键」（报告里留个空字段，读的人分不清是没填还是丢了）。
