@@ -5625,6 +5625,69 @@ def main() -> int:
             f"常量={APP_VERSION!r} CHANGELOG={_first_version!r}",
         )
 
+        # pyproject.toml 是第三处版本号。它不进程序，但 pip 与编辑器会读它，
+        # 与常量不一致时没有任何报错，只是某天从元数据里拿到一个旧版本。
+        _pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        _meta_version = ""
+        try:
+            import tomllib
+
+            _meta_version = tomllib.loads(
+                _pyproject.read_text(encoding="utf-8")
+            )["project"]["version"]
+        except (OSError, KeyError, ValueError, ImportError):
+            _meta_version = ""
+        check(
+            "pyproject 的版本与版本常量一致",
+            _meta_version == APP_VERSION,
+            f"常量={APP_VERSION!r} pyproject={_meta_version!r}",
+        )
+
+        # 词库不在版本库里，靠 scripts/fetch_dict.py 下载，哈希只在那个脚本里
+        # 写一份。换了词库却忘了同步时，别人下到的是旧文件，校验失败也看不出
+        # 该改哪里——所以拿本地这份实算一遍，跟声明值比。
+        from app.providers.offline import OFFLINE_DB_NAME
+
+        _project_root = Path(__file__).resolve().parents[1]
+        _dict_path = _project_root / "assets" / OFFLINE_DB_NAME
+        _fetch_src = (_project_root / "scripts" / "fetch_dict.py").read_text(
+            encoding="utf-8"
+        )
+        _declared = re.search(r'^DICT_SHA256 = "([0-9a-f]{64})"', _fetch_src, re.M)
+        _actual = ""
+        if _dict_path.exists():
+            import hashlib
+
+            _hasher = hashlib.sha256()
+            with _dict_path.open("rb") as _fh:
+                for _blk in iter(lambda: _fh.read(1 << 20), b""):
+                    _hasher.update(_blk)
+            _actual = _hasher.hexdigest()
+        check(
+            "下载脚本声明的词库哈希与本地词库一致",
+            bool(_declared) and _actual == _declared.group(1),
+            f"声明={_declared.group(1) if _declared else '未找到'} "
+            f"实算={_actual or '本地无词库'}",
+        )
+        # 按 ast 读出 datas，不做文本包含。文本包含会被注释行骗过去：
+        # 把这一行注释掉，字符串还在文件里，判据照样绿——那就成了装饰。
+        _spec_text = (_project_root / "Quill.spec").read_text(encoding="utf-8")
+        _spec_datas: list = []
+        try:
+            import ast as _ast
+
+            for _node in _ast.walk(_ast.parse(_spec_text)):
+                if isinstance(_node, _ast.keyword) and _node.arg == "datas":
+                    _spec_datas = list(_ast.literal_eval(_node.value))
+        except (SyntaxError, ValueError):
+            _spec_datas = []
+        _packed = sorted(str(_src) for _src, _dst in _spec_datas)
+        check(
+            "打包配置引用了离线词库（漏掉会打出查什么都未收录的包）",
+            f"assets/{OFFLINE_DB_NAME}" in _packed,
+            f"datas 里的源文件：{_packed}",
+        )
+
         # 配置写入必须原子完成：写到一半坏掉时，读取侧会静默退回默认值，
         # 用户的「已拒绝统计」选择就丢了，下次启动会重新弹告知页。
         _atomic_dir = Path(tempfile.mkdtemp(prefix="quill_selfcheck_cfg_"))

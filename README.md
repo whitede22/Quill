@@ -78,9 +78,12 @@ v1.3.0（2026-10-28）：新增本地使用统计（默认关闭、可随时删�
 cd quill
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
+.venv/Scripts/python.exe scripts/fetch_dict.py
 ```
 
 依赖只有 PySide6 和 httpx 两个。
+
+最后一步下载离线词库。它 64.8 MB，超过 GitHub 对单文件的建议上限，所以不进版本库，改由 Release 托管，下载后用 sha256 校验。这一步不做，程序启动会直接报找不到词库，`build.py` 也会拒绝打包。
 
 ## 运行
 
@@ -118,7 +121,7 @@ python -m venv .venv
 
 ## 内置离线词典
 
-数据源是 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT 许可），经 `scripts/build_offline_dict.py` 构建成本地 SQLite。
+数据源是 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT 许可），经 `scripts/build_offline_dict.py` 构建成本地 SQLite。仓库里只有构建脚本，成品库由 `scripts/fetch_dict.py` 从 Release 下载。
 
 | 项 | 值 |
 |---|---|
@@ -200,15 +203,16 @@ app/
   security/keystore.py DPAPI 封装
   ui/                  主窗口、详情面板、主题、线程、设置、背景图与全局热键
 scripts/
-  selfcheck.py         数据层自检（614 项）
+  selfcheck.py         数据层自检（618 项）
   gui_smoke.py         GUI 交互冒烟（285 项）
   http_smoke.py        HTTP 链路端到端（54 项）
   lock_check.py        单实例锁（跨进程）
-  mutation_check.py    变异测试（174 项）
+  mutation_check.py    变异测试（176 项）
   ablation_check.py    消融实验（33 项）
   prove_checks.py      自证脚本（15 条）
   check_trim.py        裁剪依赖校验
   build_offline_dict.py 构建离线词典
+  fetch_dict.py        下载并校验离线词库
   screenshot.py        预览图生成
   make_icon.py         生成应用图标
   clean_temp.py        清理本套工具留下的临时目录

@@ -69,20 +69,40 @@ def park(path: Path) -> Path | None:
     return target
 
 
-def ensure_assets() -> None:
-    """图标是构建输入之一。缺失时先按脚本生成，避免打出无图标的 exe。
+def offline_db_name() -> str:
+    """词库文件名只在 `app/providers/offline.py` 定义一次。
 
-    图标同时被 Quill.spec 的 icon 参数与 datas 引用，缺文件时 PyInstaller
-    会构建失败或产出无图标程序，因此这里先行补齐。
+    不在顶层 import：`app.providers` 的 __init__ 会连带拉起 httpx 与整条
+    provider 栈，构建脚本没必要背这个副作用。
     """
-    if (ROOT / "assets" / "quill.ico").exists():
-        return
-    print("未找到 assets/quill.ico，正在生成…")
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "make_icon.py")], cwd=ROOT
-    )
-    if result.returncode != 0:
-        print("图标生成失败，请手动运行 scripts/make_icon.py")
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from app.providers.offline import OFFLINE_DB_NAME  # noqa: PLC0415
+
+    return OFFLINE_DB_NAME
+
+
+def ensure_assets() -> None:
+    """图标与离线词库都是构建输入，缺一个就会打出坏包。
+
+    图标缺失时先按脚本生成。词库不自动下载：64.8 MB，进了版本库就不该悄悄
+    再拉一份，交给 `scripts/fetch_dict.py` 显式处理。缺词库时 PyInstaller 会
+    在 datas 阶段报一句 `Unable to find` 然后继续，最后产出一个「查什么都
+    说未收录」的包——与其让人从界面症状往回猜，不如在这里停下。
+    """
+    if not (ROOT / "assets" / "quill.ico").exists():
+        print("未找到 assets/quill.ico，正在生成…")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "make_icon.py")], cwd=ROOT
+        )
+        if result.returncode != 0:
+            print("图标生成失败，请手动运行 scripts/make_icon.py")
+            raise SystemExit(1)
+
+    dict_name = offline_db_name()
+    if not (ROOT / "assets" / dict_name).exists():
+        print(f"缺少离线词库 assets/{dict_name}，无法打包。")
+        print(f"先运行：{sys.executable} scripts/fetch_dict.py")
         raise SystemExit(1)
 
 

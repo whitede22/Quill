@@ -21,6 +21,11 @@ NVIDIA Corporation/
 # ---------- 离线词库的构建源数据（ECDICT 原始库，上百 MB，只用于生成 assets/offline_dict.db） ----------
 _ecdict_src/
 
+# ---------- 随包分发的离线词库（64.8 MB，超过 GitHub 对单文件的建议上限） ----------
+# 由 scripts/fetch_dict.py 从 Release 下载并校验 sha256。不进版本库，但仍在
+# 本地磁盘上，Quill.spec 的 datas 照常引用它。
+assets/offline_dict.db
+
 # ---------- 系统 / 编辑器噪声 ----------
 .DS_Store
 Thumbs.db

@@ -1,0 +1,59 @@
+name: ci
+
+# 门禁只做一件事：把本机手动跑的那四个套件在干净环境里重跑一遍。
+# 变异与消融不进 CI：合计一个多小时，改动一次代码就跑一遍不现实，
+# 它们留在发版前手跑。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: 安装锁定依赖
+        run: python -m pip install --disable-pip-version-check -r requirements.lock
+
+      - name: 下载离线词库
+        run: python scripts/fetch_dict.py
+
+      - name: 自检
+        run: python scripts/selfcheck.py
+
+      - name: HTTP 链路
+        run: python scripts/http_smoke.py
+
+      - name: 单实例锁
+        run: python scripts/lock_check.py
+
+      - name: 界面冒烟
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python scripts/gui_smoke.py
+
+      - name: 失败时留档
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: |
+            selfcheck_result.txt
+          if-no-files-found: ignore
+          retention-days: 7

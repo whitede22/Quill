@@ -1,0 +1,21 @@
+# 项目元数据。不是可安装的 Python 包（没有 build-system，也没有包目录结构），
+# 放在这里的目的是把「需要哪个 Python」「运行时要装什么」写进机器可读的位置，
+# 让 pip、编辑器与 CI 不必从 README 的自然语言里猜。
+#
+# version 与 app/version.py 同源，自检会核对两者相等；改版本号时两处一起改。
+
+[project]
+name = "quill"
+version = "1.3.0"
+description = "本地优先的英语生词本桌面程序"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "wtd22" }]
+dependencies = [
+    "PySide6>=6.8",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/whitede22/Quill"

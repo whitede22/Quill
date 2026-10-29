@@ -1,0 +1,32 @@
+# 可复现构建用的精确版本快照。
+#
+# requirements.txt 是可读的宽松约束（「>= 某个版本」），这份文件是某台机器上
+# 真跑通全部套件的那一组。CI 与发布包都按这份装，避免上游发个新小版本就让
+# 打包产物或测试结果变样。
+#
+# 更新办法：在干净 venv 里按 requirements.txt 装好，跑完全部套件，再按实际
+# 装到的版本改这里。
+#
+# 注意 PySide6 只装 Essentials：QtCore / QtGui / QtWidgets / QtNetwork 与
+# QtPdf 都在其中，Addons（WebEngine、Multimedia 等）项目用不到，装上会让
+# 发布包白白大几百 MB。
+
+# ---------- 运行时 ----------
+PySide6_Essentials==6.11.2
+shiboken6==6.11.2
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+anyio==4.15.1
+certifi==2026.7.22
+idna==3.20
+sniffio==1.3.1
+typing_extensions==4.16.0
+
+# ---------- 打包 ----------
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.7
+altgraph==0.17.5
+packaging==26.3
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
