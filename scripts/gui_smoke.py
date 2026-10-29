@@ -864,6 +864,8 @@ EXPECT: dict = {
     "已表态不再弹": True,
     "未勾选记录时拒绝提交报告": (0, True),
     "未配置地址时先问是否走 GitHub": True,
+    "空署名时提交被拦下": True,
+    "填了署名才写报告文件": True,
     # 复习模式（review_check）。
     "待复习按钮在生词本模式可见": True,
     "新词进入复习计划（待复习数 +1）": True,
@@ -2512,6 +2514,37 @@ def main() -> int:
             bool(asked) and "配置" in asked[0] and not opened
         )
         sd2.deleteLater()
+
+        # ⑧ 署名必填：空着点提交时对话框不关、不落盘；填上才走到写文件那一步。
+        #    判据用「写文件被调用了几次」而不是「提示框出现了没有」——前者是
+        #    真实的副作用，后者只要某处设了一次文字就会被误判为通过。
+        wrote: list[int] = []
+        real_write = sm.report.write_report
+        sm.report.write_report = lambda payload, target: (wrote.append(1), str(target))[1]
+        dlg = sm.ReportDialog(
+            window.config["theme"],
+            {
+                "report_schema_version": 1,
+                "quill_version": "9.9.9",
+                "generated_at": "2026-10-29 17:00",
+                "period_days": 30,
+                "event_total": 3,
+                "by_event": {"lookup": 3},
+            },
+            window,
+            mode="submit",
+            submitter="",
+        )
+        dlg._do_save()
+        blocked = dlg.saved_path is None and not wrote
+        dlg.name_edit.setText("小明")
+        dlg.note_edit.setPlainText("希望生词本支持导出")
+        dlg._do_save()
+        filled = dlg.saved_path is not None and len(wrote) == 1
+        sm.report.write_report = real_write
+        results["空署名时提交被拦下"] = blocked
+        results["填了署名才写报告文件"] = filled
+        dlg.deleteLater()
         os.environ.pop("QUILL_REPORT_ENDPOINT", None)
 
         # 收尾：把配置恢复成「已表态、关着」，与 main() 开头的基线一致，

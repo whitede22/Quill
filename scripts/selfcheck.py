@@ -5774,6 +5774,46 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check("统计默认关闭且未表态", False, str(exc))
 
+    # ---- 提交报告时的署名与备注 ----
+    # 判据挑两处：截断（服务端对摘要单行有 200 字上限，超了整份退回）与
+    # 「空署名不留空键」（报告里留个空字段，读的人分不清是没填还是丢了）。
+    try:
+        from app.core import report as report_mod  # noqa: PLC0415
+
+        _ctx = {"event_total": 3, "quill_version": "9.9.9", "generated_at": "2026-10-29"}
+        report_mod.attach_context(_ctx, "  小明  ", "  加个生词本导出吧  ")
+        check("署名去掉首尾空白", _ctx.get("submitter") == "小明", str(_ctx.get("submitter")))
+        check("备注去掉首尾空白", _ctx.get("note") == "加个生词本导出吧", str(_ctx.get("note")))
+        check("署名排在摘要第一行", report_mod.summary_lines(_ctx)[0] == "提交者：小明")
+        check("备注排在摘要第二行", report_mod.summary_lines(_ctx)[1] == "备注：加个生词本导出吧")
+
+        _long = {"event_total": 3}
+        report_mod.attach_context(_long, "名" * 40, "字" * 400)
+        check(
+            "署名截断到上限",
+            len(_long["submitter"]) == report_mod.MAX_SUBMITTER,
+            str(len(_long["submitter"])),
+        )
+        check(
+            "备注截断到上限",
+            len(_long["note"]) == report_mod.MAX_NOTE,
+            str(len(_long["note"])),
+        )
+        # 两处口径的交接点：摘要每行进邮件正文，中转函数对单行有 200 字上限
+        # （见 `_validate`）。上限一旦调大，这里先红，不用等真发一封被退回。
+        _longest = max(len(x) for x in report_mod.summary_lines(_long))
+        check("最长一行摘要仍在中转上限内", _longest <= 200, f"{_longest} 字")
+
+        _blank = {"event_total": 3}
+        report_mod.attach_context(_blank, "   ", "")
+        check(
+            "空署名与空备注不留空键",
+            "submitter" not in _blank and "note" not in _blank,
+            str(sorted(_blank)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("署名与备注写进报告", False, str(exc))
+
     # ---- 使用报告中转函数（server/report_relay） ----
     # 它不随程序打包，也没有被任何模块导入，部署时单独上传。判据打在密钥、
     # 结构校验、邮件内容三处：这三处坏掉都不抛异常，只是报告悄悄发不出去、

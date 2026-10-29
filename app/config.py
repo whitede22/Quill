@@ -103,6 +103,9 @@ DEFAULT_CONFIG: dict = {
     "analytics_consent_decided": False,
     # 统计数据结构版本。事件表结构变化时 +1，用于报告与旧库兼容判断。
     "analytics_schema_version": 1,
+    # 提交报告时的署名，空表示还没填过。只为了下次不用重输，它不进统计、
+    # 也不参与任何别的判断——删掉这一行等于清空预填，没有其他后果。
+    "report_name": "",
 }
 
 # 接入模式白名单。写在这里而不是散落在 UI 与 provider 里，避免各判一套。
@@ -233,6 +236,7 @@ _COERCERS: dict = {
     "analytics_enabled": _coerce_bool,
     "analytics_consent_decided": _coerce_bool,
     "analytics_schema_version": _coerce_int,
+    "report_name": _coerce_text,
     # 必须登记在这里。save_config() 只保存 _COERCERS 里出现过的字段，
     # 漏登记的表现是「在设置里关掉兜底、重启后又自己打开了」——
     # 开关形同虚设，而且不会报任何错。

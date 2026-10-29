@@ -38,6 +38,12 @@ SUBMIT_TIMEOUT = 25.0
 # 不是数据库备份，几百 KB 的附件没人会附到 Issue 里。
 MAX_EVENTS = 1000
 
+# 提交者与备注的长度上限。两个值都被中转函数间接约束着：它们会作为摘要的一行
+# 进邮件正文，而服务端对单行有 200 字的上限，超出整份退回。150 给「备注：」
+# 前缀留了余量，不必让用户先撞一次 400 才知道写太长了。
+MAX_SUBMITTER = 20
+MAX_NOTE = 150
+
 # 报告里明确写出「有什么、没有什么」，用户在看预览时不必翻代码。
 _INCLUDES = (
     "功能使用次数（查词、复习、导入、导出、启动）",
@@ -109,15 +115,48 @@ def write_report(payload: dict, path: Path | str) -> Path:
     return target
 
 
+def attach_context(payload: dict, submitter: str, note: str = "") -> dict:
+    """把署名与备注写进报告，返回同一个 dict。
+
+    两项都截断到上限再写：截断在这里做而不是只靠界面限制，是因为报告也可能
+    从别的入口拼出来（自检、GitHub 那条备用通道），一处没拦就会让整份邮件
+    被服务端退回。
+
+    署名是空的时候**不写空串**，直接把键去掉——报告里留一个空字段，读的人
+    分不清是「没填」还是「填的时候丢了」。
+    """
+    name = submitter.strip()[:MAX_SUBMITTER]
+    text = note.strip()[:MAX_NOTE]
+    if name:
+        payload["submitter"] = name
+    else:
+        payload.pop("submitter", None)
+    if text:
+        payload["note"] = text
+    else:
+        payload.pop("note", None)
+    return payload
+
+
 def summary_lines(payload: dict) -> list[str]:
-    """把报告的要点压成几行字，给预览与摘要共用。"""
+    """把报告的要点压成几行字，给预览与摘要共用。
+
+    署名与备注排在最前：收信的人先要知道这是谁、想说什么，再去看计数。
+    """
     total = payload.get("event_total", 0)
-    lines = [
-        f"Quill 版本：{payload.get('quill_version', '')}",
-        f"报告生成时间：{payload.get('generated_at', '')}",
-        f"统计周期：最近 {payload.get('period_days', 0)} 天",
-        f"事件总数：{total}",
-    ]
+    lines = []
+    if payload.get("submitter"):
+        lines.append(f"提交者：{payload['submitter']}")
+    if payload.get("note"):
+        lines.append(f"备注：{payload['note']}")
+    lines.extend(
+        [
+            f"Quill 版本：{payload.get('quill_version', '')}",
+            f"报告生成时间：{payload.get('generated_at', '')}",
+            f"统计周期：最近 {payload.get('period_days', 0)} 天",
+            f"事件总数：{total}",
+        ]
+    )
     by_event = payload.get("by_event") or {}
     if by_event:
         detail = "、".join(f"{name} {count}" for name, count in sorted(by_event.items()))

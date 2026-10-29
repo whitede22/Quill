@@ -16,8 +16,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -37,6 +40,7 @@ class ReportDialog(QDialog):
         parent: QWidget | None = None,
         *,
         mode: str = "save",
+        submitter: str = "",
     ) -> None:
         super().__init__(parent)
         self._payload = payload
@@ -62,9 +66,12 @@ class ReportDialog(QDialog):
         head.setObjectName("featureBody")
         layout.addWidget(head)
 
-        summary = QLabel("\n".join(report.summary_lines(payload)))
-        summary.setWordWrap(True)
-        layout.addWidget(summary)
+        # 摘要只在这一刻算一次，之后不随输入重算：它跟着署名与备注增减行数，
+        # 每敲一个字就让窗口改高矮，比少显示两行更让人分心。表单里的两行去向
+        # 写在输入框下面，不靠实时预览来说明。
+        self._summary = QLabel("\n".join(report.summary_lines(payload)))
+        self._summary.setWordWrap(True)
+        layout.addWidget(self._summary)
 
         privacy = payload.get("privacy") or {}
         includes = "、".join(privacy.get("includes") or [])
@@ -88,6 +95,7 @@ class ReportDialog(QDialog):
             how.setObjectName("muted")
             how.setWordWrap(True)
             layout.addWidget(how)
+            layout.addWidget(self._build_contact(submitter))
 
         self._note = QLabel()
         self._note.setObjectName("warn")
@@ -97,6 +105,82 @@ class ReportDialog(QDialog):
 
         layout.addSpacing(4)
         layout.addLayout(self._buttons(mode))
+
+    def _build_contact(self, submitter: str) -> QWidget:
+        """署名与备注的输入区。
+
+        署名必填：附件是匿名的，没有署名时作者想追问一句都不知道问谁。
+        备注选填：愿意写就写，不想写也不拦——肯点提交本身已经是帮忙了。
+        """
+        box = QWidget()
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(0, 6, 0, 0)
+        outer.setSpacing(4)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(6)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.name_edit = QLineEdit(submitter)
+        self.name_edit.setMaxLength(report.MAX_SUBMITTER)
+        self.name_edit.setPlaceholderText("昵称就行，作者要靠它认出你是谁")
+        self.name_edit.textChanged.connect(self._sync_payload)
+
+        self.note_edit = QPlainTextEdit()
+        self.note_edit.setPlaceholderText("哪里不好用、缺什么功能，写一句也算数")
+        self.note_edit.setFixedHeight(68)
+        self.note_edit.textChanged.connect(self._trim_note)
+
+        where = QLabel("这两行跟着摘要进邮件正文，也写进附件。")
+        where.setObjectName("muted")
+        where.setWordWrap(True)
+
+        form.addRow("怎么称呼你", self.name_edit)
+        form.addRow("想说的话", self.note_edit)
+        outer.addLayout(form)
+        outer.addWidget(where)
+        return box
+
+    def _trim_note(self) -> None:
+        """备注超出上限就地截断。
+
+        `QPlainTextEdit` 没有 `setMaxLength`，只能在变化后截。截完要恢复光标，
+        否则光标跳到开头，接着打字会从第一字开始插。
+        """
+        text = self.note_edit.toPlainText()
+        if len(text) <= report.MAX_NOTE:
+            self._sync_payload()
+            return
+        cursor = self.note_edit.textCursor()
+        position = cursor.position()
+        self.note_edit.blockSignals(True)
+        self.note_edit.setPlainText(text[: report.MAX_NOTE])
+        self.note_edit.blockSignals(False)
+        cursor.setPosition(min(position, report.MAX_NOTE))
+        self.note_edit.setTextCursor(cursor)
+        self._sync_payload()
+
+    def _sync_payload(self) -> None:
+        """把输入框里的两项随时写进报告。
+
+        落盘发生在按按钮那一刻，而发送用的是同一个 dict，所以它必须在输入时
+        就保持最新——只在 `_do_save` 里写一次的话，二次打开对话框、改了名字
+        再提交，发出去的还是上一次的署名。
+        """
+        report.attach_context(self._payload, self.submitter, self.note_text)
+
+    @property
+    def submitter(self) -> str:
+        """当前填的署名。保存模式下没有这个输入框，返回空串。"""
+        edit = getattr(self, "name_edit", None)
+        return edit.text().strip() if edit is not None else ""
+
+    @property
+    def note_text(self) -> str:
+        """当前填的备注，同样是保存模式下的空串。"""
+        edit = getattr(self, "note_edit", None)
+        return edit.toPlainText().strip() if edit is not None else ""
 
     def _buttons(self, mode: str) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -130,9 +214,18 @@ class ReportDialog(QDialog):
         return Path(chosen) if chosen else None
 
     def _do_save(self) -> None:
+        if self._mode == "submit" and not self.submitter:
+            # 拦在这里而不是拦在发信之后：报告一旦发出就收不回来，而署名是唯一
+            # 能让作者回信的东西。提示留在对话框里，填完可以接着提交。
+            self._note.setText("先填一个称呼，作者要知道是谁发的。")
+            self._note.setVisible(True)
+            self.name_edit.setFocus()
+            return
+
         target = self._target_path()
         if target is None:
             return
+        self._sync_payload()
         try:
             path = report.write_report(self._payload, target)
         except OSError as exc:

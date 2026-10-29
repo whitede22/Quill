@@ -518,11 +518,19 @@ QListWidget {
 }
 
 /* 设置里「提交报告」的独立区域。它与生词卡片的区别在**没有悬停变化**：这个
-   框不是可点区域，整块高亮等于承诺一个不存在的点击。 */
+   框不是可点区域，整块高亮等于承诺一个不存在的点击。
+   底色与描边用强调色那一族，而不是 `$border`：这一块要在一屏十来个控件里被
+   先看到，灰边白底跟周围的输入框没有区别。深浅两套底座各有自己的 `accent_soft`，
+   所以同一条规则在 night 下也是深底浅边，不会出现浅色块砸在深色界面上。 */
 QFrame#notice {
-    background: $surface;
-    border: 1px solid $border;
+    background: $accent_soft;
+    border: 1px solid $accent;
     border-radius: $radius_container;
+}
+/* 这一块的抬头。用强调色而不是 `$text`，是为了让「帮助」那句话与下面的说明
+   文字分开两个层级；它只出现在这一个地方，不跟 `#sectionTitle` 合并。 */
+QLabel#noticeTitle {
+    font-size: 14px; font-weight: 700; color: $accent;
 }
 
 /* 卡片刻意保持**不透明**：列表项文字是透明画的、一直靠卡片盖住它。卡片一透

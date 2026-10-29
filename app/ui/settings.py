@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import KEY_PATH, check_config
+from ..config import KEY_PATH, check_config, load_config, save_config
 from ..core import analytics, report
 from ..providers import offline_dict_status, resolve_offline_dict
 from ..providers.openai_compat import OpenAICompatProvider
@@ -236,8 +236,10 @@ class SettingsDialog(QDialog):
         """「提交报告」独立成块。
 
         摆在一排次要按钮里的后果是：用户扫过去只看到五个一样大的词，而不明白
-        这一下会把东西发到别人的邮箱。标题写清去向，正文写清发什么、不发什么，
-        按钮换成主色，「先看看要发什么」留在旁边给不肯盲点的人。
+        这一下会把东西发到别人的邮箱。所以整块用强调色铺底描边，抬头直接说
+        「需要你的帮助」——这句话是这一块存在的理由，放在最上面比放在说明里
+        更容易被读到。正文写清发什么、不发什么，按钮换成主色，
+        「先看看要发什么」留在旁边给不肯盲点的人。
         """
         notice = QFrame()
         notice.setObjectName("notice")
@@ -247,6 +249,8 @@ class SettingsDialog(QDialog):
 
         text = QVBoxLayout()
         text.setSpacing(3)
+        ask = QLabel("我们需要你的帮助！")
+        ask.setObjectName("noticeTitle")
         title = QLabel("把使用情况发给作者")
         title.setObjectName("sectionTitle")
         body = QLabel(
@@ -255,6 +259,7 @@ class SettingsDialog(QDialog):
         )
         body.setObjectName("muted")
         body.setWordWrap(True)
+        text.addWidget(ask)
         text.addWidget(title)
         text.addWidget(body)
 
@@ -506,10 +511,29 @@ class SettingsDialog(QDialog):
             if self._ask_github("这个版本还没有配置提交地址，报告可以改用 GitHub 提交。"):
                 QDesktopServices.openUrl(QUrl(report.issue_url(payload)))
             return
-        dialog = ReportDialog(self._current_theme(), payload, self, mode="submit")
+        dialog = ReportDialog(
+            self._current_theme(),
+            payload,
+            self,
+            mode="submit",
+            submitter=str(self._config.get("report_name") or ""),
+        )
         if not (dialog.exec() and dialog.saved_path):
             return
+        self._remember_name(dialog.submitter)
         self._start_sending(payload, dialog.saved_path)
+
+    def _remember_name(self, name: str) -> None:
+        """把署名记进配置，下次预填。
+
+        直接落盘，不等设置页的「保存」：用户提交完通常就关窗口了，等不到他
+        再去点一次保存。这份写入只覆盖署名一个键，设置页里尚未保存的其他改动
+        仍然按原样留在表单里。
+        """
+        self._config["report_name"] = name
+        cfg = load_config()
+        cfg["report_name"] = name
+        save_config(cfg)
 
     def _start_sending(self, payload: dict, path: Path) -> None:
         """提交要过网络，不能占着主线程，否则界面在等待期间完全不响应。"""
