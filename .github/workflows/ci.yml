@@ -18,6 +18,12 @@ jobs:
   check:
     runs-on: windows-latest
     timeout-minutes: 30
+    # runner 的系统代码页是 cp1252。输出重定向到管道时，Python 按 locale 编码
+    # 写标准输出，中文一 print 就抛 UnicodeEncodeError——四个套件全都用中文
+    # 打日志，第一次跑就倒在第一步。本机是 cp936，同样的重定向能过，所以这个
+    # 故障只能在 CI 里复现。四个套件都会踩，因此放在作业一级。
+    env:
+      PYTHONIOENCODING: utf-8
 
     steps:
       - uses: actions/checkout@v4
