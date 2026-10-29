@@ -5774,6 +5774,113 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check("统计默认关闭且未表态", False, str(exc))
 
+    # ---- 使用报告中转函数（server/report_relay） ----
+    # 它不随程序打包，也没有被任何模块导入，部署时单独上传。判据打在密钥、
+    # 结构校验、邮件内容三处：这三处坏掉都不抛异常，只是报告悄悄发不出去、
+    # 或者发到错误的地方。
+    try:
+        _relay = _load_relay()
+        os.environ["REPORT_KEY"] = "check-key"
+        os.environ["SMTP_USER"] = "sender@example.com"
+        os.environ["MAIL_TO"] = "author@example.com"
+        _mails: list = []
+        _real_send = _relay._send
+        _relay._send = lambda message: _mails.append(message)
+
+        _good = {
+            "report": {
+                "report_schema_version": 1,
+                "quill_version": "9.9.9",
+                "generated_at": "2026-10-29 17:00",
+                "event_total": 5,
+            },
+            "summary": ["Quill 版本：9.9.9", "事件总数：5"],
+        }
+
+        def _call(body, *, key="check-key", method="POST", ip="10.1.0.1", raw=""):
+            return _relay.main_handler(
+                {
+                    "httpMethod": method,
+                    "headers": {"x-report-key": key},
+                    "body": raw or json.dumps(body, ensure_ascii=False),
+                    "requestContext": {"identity": {"sourceIp": ip}},
+                },
+                None,
+            )
+
+        check("中转拒绝非 POST", _call(_good, method="GET", ip="10.1.0.1")["statusCode"] == 405)
+        check("中转拒绝错误密钥", _call(_good, key="wrong", ip="10.1.0.2")["statusCode"] == 401)
+
+        _ok = _call(_good, ip="10.1.0.3")
+        check("中转接受合格请求", _ok["statusCode"] == 200, _ok["body"])
+        check("中转回一个成功标记", json.loads(_ok["body"]).get("ok") is True)
+        check("中转只生成一封邮件", len(_mails) == 1, f"{len(_mails)} 封")
+
+        _mail = _mails[0]
+        check("邮件主题带版本", "9.9.9" in _mail["Subject"], _mail["Subject"])
+        check("邮件发往配置的收件人", _mail["To"] == "author@example.com", _mail["To"])
+        _atts = list(_mail.iter_attachments())
+        check(
+            "邮件带一份 JSON 附件",
+            len(_atts) == 1 and _atts[0].get_filename().endswith(".json"),
+            str([a.get_filename() for a in _atts]),
+        )
+        check(
+            "附件内容是完整报告",
+            json.loads(_atts[0].get_content())["event_total"] == 5,
+        )
+        # 顶层是 multipart/mixed，取正文要指名那一部分；直接 get_content()
+        # 会抛 KeyError，而异常被外层吞掉后看起来像「中转函数坏了」。
+        _body_part = _mail.get_body(preferencelist=("plain",))
+        check(
+            "正文用的是客户端摘要",
+            _body_part is not None and "事件总数：5" in _body_part.get_content(),
+        )
+
+        check(
+            "中转拒绝缺少 report",
+            _call({"summary": ["x"]}, ip="10.1.0.4")["statusCode"] == 400,
+        )
+        check(
+            "中转拒绝零事件",
+            _call(
+                {"report": {**_good["report"], "event_total": 0}, "summary": ["x"]},
+                ip="10.1.0.5",
+            )["statusCode"]
+            == 400,
+        )
+        check(
+            "中转拒绝超长摘要",
+            _call({"report": _good["report"], "summary": ["x" * 201]}, ip="10.1.0.6")[
+                "statusCode"
+            ]
+            == 400,
+        )
+        check("中转拒绝非 JSON", _call({}, raw="not json", ip="10.1.0.7")["statusCode"] == 400)
+        check(
+            "中转拒绝超大请求体",
+            _call({}, raw="x" * (256 * 1024 + 1), ip="10.1.0.8")["statusCode"] == 413,
+        )
+
+        _burst = [_call(_good, ip="10.1.0.9")["statusCode"] for _ in range(4)]
+        check(
+            "中转对同一来源限流",
+            _burst[:3] == [200, 200, 200] and _burst[3] == 429,
+            str(_burst),
+        )
+
+        def _broken(_message):
+            raise OSError("smtp 不通")
+
+        _relay._send = _broken
+        check("发信失败返回 502", _call(_good, ip="10.1.0.10")["statusCode"] == 502)
+        _relay._send = _real_send
+    except Exception as exc:  # noqa: BLE001
+        check("中转函数检查可执行", False, str(exc))
+    finally:
+        for _key in ("REPORT_KEY", "SMTP_USER", "MAIL_TO"):
+            os.environ.pop(_key, None)
+
     conn.close()
 
     print("=" * 56)
@@ -5784,6 +5891,21 @@ def main() -> int:
     print("=" * 56)
     print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     return 1 if FAILED else 0
+
+
+def _load_relay():
+    """按文件路径加载中转函数。
+
+    它不在 app 包里，部署时单独上传到云函数，仓库里没有任何模块导入它。
+    所以这里也只能按路径加载，顺带证明它单独拿出来是可运行的。
+    """
+    import importlib.util
+
+    path = ROOT / "server" / "report_relay" / "main.py"
+    spec = importlib.util.spec_from_file_location("quill_report_relay", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _temp_leftovers() -> list[str]:

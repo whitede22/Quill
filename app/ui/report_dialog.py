@@ -4,16 +4,15 @@
 他有权在文件落地之前知道里面有什么。所以对话框把「包含什么、不包含什么」
 摆在按钮上面，而不是塞进帮助文档。
 
-提交时打开的是 GitHub 新建 Issue 页，报告文件由用户自己拖进去。程序无法
-确认用户最后是否点了提交，所有文案都停在「已保存并打开提交页」，不写「已提交」。
+提交模式下对话框只负责落盘，发信由调用方在后台线程完成。网络请求放在这里
+会把对话框卡住，而等待二十五秒的界面与死掉没有区别。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -29,7 +28,7 @@ from .theme import stylesheet
 
 
 class ReportDialog(QDialog):
-    """`mode="save"` 让用户挑位置；`mode="submit"` 存到默认目录并打开 Issue 页。"""
+    """`mode="save"` 让用户挑位置；`mode="submit"` 存到默认目录，由调用方发送。"""
 
     def __init__(
         self,
@@ -57,7 +56,7 @@ class ReportDialog(QDialog):
 
         head = QLabel(
             "报告已生成，还没有保存。下面是它的全部内容概览。" if mode == "save"
-            else "报告会先保存到本机，再打开 GitHub 的新建 Issue 页，文件需要你自己拖进去。"
+            else "报告会存一份到本机，然后把内容发给作者。发送失败时本地这份还在。"
         )
         head.setWordWrap(True)
         head.setObjectName("featureBody")
@@ -83,9 +82,8 @@ class ReportDialog(QDialog):
 
         if mode == "submit":
             how = QLabel(
-                "点下面的按钮之后：报告存到数据目录的 reports 子文件夹，"
-                "该文件夹会打开，报告路径已复制到剪贴板，浏览器打开提交页。\n"
-                "把 JSON 文件拖进 Issue 的输入框，检查一遍内容，再自己点提交。"
+                "报告经中转服务发出，邮件正文是上面几行摘要，完整 JSON 作为附件。"
+                "不经过 GitHub，也不需要注册账号。"
             )
             how.setObjectName("muted")
             how.setWordWrap(True)
@@ -104,9 +102,7 @@ class ReportDialog(QDialog):
         row = QHBoxLayout()
         row.setSpacing(12)
 
-        primary = QPushButton(
-            "保存并打开提交页" if mode == "submit" else "选择位置保存"
-        )
+        primary = QPushButton("保存并提交" if mode == "submit" else "选择位置保存")
         primary.setObjectName("primary")
         primary.setCursor(Qt.CursorShape.PointingHandCursor)
         primary.setMinimumWidth(150)
@@ -147,8 +143,5 @@ class ReportDialog(QDialog):
             return
 
         self.saved_path = path
-        if self._mode == "submit":
-            QGuiApplication.clipboard().setText(str(path))
-            QDesktopServices.openUrl(QUrl(report.issue_url(self._payload)))
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
         self.accept()
+

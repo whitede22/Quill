@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtCore import QSize, Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -83,6 +83,9 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(460)
         self._config = dict(config)
         self._init_callbacks(on_theme_preview, on_restore, on_rebuild_index, config)
+        # 提交在后台线程跑，期间禁用按钮，避免连点发出多封邮件。
+        self._report_sending = False
+        self._report_btn: QPushButton | None = None
         self._build_provider_fields(config, api_key)
         form = self._build_form(config)
         offline_hint, storage = self._build_storage_notes()
@@ -208,7 +211,7 @@ class SettingsDialog(QDialog):
         for text, slot, tip in (
             ("查看摘要", self._show_summary, "这台电脑到目前为止记了多少条、都是哪几类。"),
             ("导出报告", self._export_report, "存成 JSON，位置由你选；文件里有什么会先列出来。"),
-            ("提交报告", self._submit_report, "存到本机并打开 GitHub 提交页，附件要自己拖进去。"),
+            ("提交报告", self._submit_report, "存一份到本机，然后把报告发给作者；发送失败时本地这份还在。"),
             ("删除统计", self._clear_stats, "只删统计数据，词库、笔记、复习进度不受影响。"),
             ("隐私说明", self._show_privacy, "重新看一遍记录范围与用途。"),
         ):
@@ -216,6 +219,8 @@ class SettingsDialog(QDialog):
             button.setObjectName("bare")
             button.setToolTip(tip)
             button.clicked.connect(slot)
+            if slot == self._submit_report:
+                self._report_btn = button
             stat_layout.addWidget(button)
         stat_layout.addStretch(1)
 
@@ -366,21 +371,78 @@ class SettingsDialog(QDialog):
                 "记录与提交是两个决定，程序不替你合并。",
             )
             return
+        if self._report_sending:
+            QMessageBox.information(
+                self, "提交使用报告", "上一份报告还在发送，等它结束再点。"
+            )
+            return
         payload = report.build_report(30)
         if not payload.get("event_total"):
             QMessageBox.information(
                 self, "提交使用报告", "还没有记录到事件，暂时没有可提交的内容。"
             )
             return
+        if not report.endpoint():
+            # 地址没配就没必要让用户填一遍表单再看失败。
+            if self._ask_github("这个版本还没有配置提交地址，报告可以改用 GitHub 提交。"):
+                QDesktopServices.openUrl(QUrl(report.issue_url(payload)))
+            return
         dialog = ReportDialog(self._current_theme(), payload, self, mode="submit")
-        if dialog.exec() and dialog.saved_path:
-            QMessageBox.information(
-                self,
-                "提交使用报告",
-                f"报告已保存：\n{dialog.saved_path}\n\n"
-                "浏览器已打开提交页，把 JSON 文件拖进输入框，检查一遍再自己点提交。\n"
-                "程序无法知道你最后有没有发出去，所以这里不写「已提交」。",
-            )
+        if not (dialog.exec() and dialog.saved_path):
+            return
+        self._start_sending(payload, dialog.saved_path)
+
+    def _start_sending(self, payload: dict, path: Path) -> None:
+        """提交要过网络，不能占着主线程，否则界面在等待期间完全不响应。"""
+        self._report_sending = True
+        if self._report_btn is not None:
+            self._report_btn.setEnabled(False)
+            self._report_btn.setText("提交中…")
+        submit(
+            report.submit,
+            payload,
+            on_success=lambda _: self._report_sent(path),
+            on_error=lambda message: self._report_failed(message, path, payload),
+            on_finished=self._reset_report_button,
+        )
+
+    def _reset_report_button(self) -> None:
+        self._report_sending = False
+        if self._report_btn is not None:
+            self._report_btn.setEnabled(True)
+            self._report_btn.setText("提交报告")
+
+    def _report_sent(self, path: Path) -> None:
+        QMessageBox.information(
+            self,
+            "提交使用报告",
+            f"报告已发出。\n\n本机留了一份：\n{path}\n不需要的话可以删掉。",
+        )
+
+    def _report_failed(self, message: str, path: Path, payload: dict) -> None:
+        """发不出去时把话说清楚，并留一条备用通道。
+
+        报告已经落盘，所以失败不是白干；把 GitHub 那条路摆在按钮上，
+        比让用户自己去项目主页找入口强。
+        """
+        detail = f"{message}\n\n报告已保存在：\n{path}"
+        if self._ask_github("报告没有发出去。", detail):
+            QDesktopServices.openUrl(QUrl(report.issue_url(payload)))
+
+    def _ask_github(self, text: str, detail: str = "") -> bool:
+        """问一句要不要改用 GitHub 提交，返回用户的选择。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("提交使用报告")
+        box.setIcon(
+            QMessageBox.Icon.Warning if detail else QMessageBox.Icon.Information
+        )
+        box.setText(text)
+        if detail:
+            box.setInformativeText(detail)
+        github = box.addButton("改用 GitHub 提交", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("知道了", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is github
 
     def _clear_stats(self) -> None:
         if not analytics.total():

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -17,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core import report  # noqa: E402
 from app.providers.base import NonRetryableError, ProviderError  # noqa: E402
 from app.providers.openai_compat import (  # noqa: E402
     OpenAICompatProvider,
@@ -159,10 +161,125 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class RelayHandler(BaseHTTPRequestHandler):
+    """模拟报告中转函数。`mode` 决定返回哪个状态码，与真函数共用同一套文案。"""
+
+    mode = "ok"
+    requests: list[dict] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - 基类要求的命名
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = {}
+        RelayHandler.requests.append(
+            {
+                "key": self.headers.get("X-Report-Key"),
+                "content_type": self.headers.get("Content-Type"),
+                "payload": body,
+            }
+        )
+        status, error = RELAY_REPLIES.get(RelayHandler.mode, (200, ""))
+        payload = {"ok": status == 200}
+        if error:
+            payload["error"] = error
+        self._respond(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def _respond(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+RELAY_REPLIES = {
+    "ok": (200, ""),
+    "unauthorized": (401, "密钥不符"),
+    "too_many": (429, "提交过于频繁，请稍后再试"),
+    "send_failed": (502, "发信失败"),
+}
+
+SAMPLE_REPORT = {
+    "report_schema_version": 1,
+    "quill_version": "9.9.9",
+    "generated_at": "2026-10-29 17:00",
+    "period_days": 30,
+    "event_total": 12,
+    "by_event": {"lookup": 12},
+}
+
+
+def check_report_submit(port: int) -> None:
+    """报告提交走真实 HTTP：请求体、密钥头、四类失败文案。
+
+    走本地桩而不是打真的中转函数：真函数会发信，测试不该产生邮件。
+    路径、头部与状态码翻译都是真的。
+    """
+    os.environ["QUILL_REPORT_ENDPOINT"] = f"http://127.0.0.1:{port}/report"
+    os.environ["QUILL_REPORT_KEY"] = "smoke-key"
+    try:
+        RelayHandler.mode = "ok"
+        RelayHandler.requests.clear()
+        report.submit(SAMPLE_REPORT, timeout=5.0)
+        check("报告提交成功不抛错", len(RelayHandler.requests) == 1)
+
+        sent = RelayHandler.requests[0]
+        check("提交带密钥头", sent["key"] == "smoke-key", str(sent["key"]))
+        check("提交带 JSON 类型", sent["content_type"] == "application/json")
+        body = sent["payload"]
+        check("提交体含完整报告", body.get("report", {}).get("event_total") == 12)
+        check("提交体含摘要行", isinstance(body.get("summary"), list) and bool(body["summary"]))
+        check(
+            "摘要与预览同源",
+            body.get("summary") == report.summary_lines(SAMPLE_REPORT),
+        )
+
+        for mode, expect in (
+            ("unauthorized", "密钥"),
+            ("too_many", "频繁"),
+            ("send_failed", "发信"),
+        ):
+            RelayHandler.mode = mode
+            try:
+                report.submit(SAMPLE_REPORT, timeout=5.0)
+                check(f"{mode} 应抛错", False, "未抛出")
+            except report.SubmitError as exc:
+                check(f"{mode} 文案指向原因", expect in str(exc), str(exc))
+
+        os.environ.pop("QUILL_REPORT_ENDPOINT")
+        try:
+            report.submit(SAMPLE_REPORT, timeout=5.0)
+            check("未配置地址应抛错", False, "未抛出")
+        except report.SubmitError as exc:
+            check("未配置地址给出说明", "配置" in str(exc), str(exc))
+
+        os.environ["QUILL_REPORT_ENDPOINT"] = "http://127.0.0.1:9/report"
+        try:
+            report.submit(SAMPLE_REPORT, timeout=1.5)
+            check("端口不通应抛错", False, "未抛出")
+        except report.SubmitError as exc:
+            message = str(exc)
+            check("端口不通给出可读中文", ("连不上" in message) or ("超时" in message), message)
+            check("端口不通不泄漏内部异常", "Errno" not in message, message)
+    finally:
+        os.environ.pop("QUILL_REPORT_ENDPOINT", None)
+        os.environ.pop("QUILL_REPORT_KEY", None)
+
+
 def main() -> int:
     server = HTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    relay = HTTPServer(("127.0.0.1", 0), RelayHandler)
+    relay_port = relay.server_address[1]
+    threading.Thread(target=relay.serve_forever, daemon=True).start()
 
     base_url = f"http://127.0.0.1:{port}/v1"
     provider = OpenAICompatProvider(base_url, "sk-smoke-test", "test-model", timeout=5.0)
@@ -336,7 +453,11 @@ def main() -> int:
         msg,
     )
 
+    # ---- 15. 使用报告提交：请求体、密钥头、失败文案 ----
+    check_report_submit(relay_port)
+
     server.shutdown()
+    relay.shutdown()
 
     print("=" * 56)
     for name in PASSED:

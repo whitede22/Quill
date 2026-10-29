@@ -863,6 +863,7 @@ EXPECT: dict = {
     "关掉告知页不算同意": True,
     "已表态不再弹": True,
     "未勾选记录时拒绝提交报告": (0, True),
+    "未配置地址时先问是否走 GitHub": True,
     # 复习模式（review_check）。
     "待复习按钮在生词本模式可见": True,
     "新词进入复习计划（待复习数 +1）": True,
@@ -2478,6 +2479,37 @@ def main() -> int:
             sm.report.build_report = real_build
         results["未勾选记录时拒绝提交报告"] = (len(built), bool(said))
         sd.deleteLater()
+
+        # ⑦ 地址没配时不该让用户白填一遍表单：不弹报告对话框，直接问要不要走 GitHub。
+        #    把断言放在「问没问」上，而不是「弹了哪个框」——后者要连 QMessageBox
+        #    的实例方法一起 mock，脆得多。对话框的 exec 也一并挡掉，这样判据失效时
+        #    结果是报红而不是把整轮卡在模态框上。
+        asked: list[str] = []
+        opened: list[int] = []
+        os.environ.pop("QUILL_REPORT_ENDPOINT", None)
+        sd2 = SettingsDialog({**window.config, "analytics_enabled": True}, "", window)
+        real_build2 = sm.report.build_report
+        real_exec2 = sm.ReportDialog.exec
+        sm.report.build_report = lambda *a, **k: {
+            "report_schema_version": 1,
+            "quill_version": "9.9.9",
+            "generated_at": "2026-10-29 17:00",
+            "period_days": 30,
+            "event_total": 3,
+            "by_event": {"lookup": 3},
+        }
+        sm.ReportDialog.exec = lambda self: (opened.append(1), 0)[1]
+        sd2._ask_github = lambda text, detail="": (asked.append(text), False)[1]
+        try:
+            sd2.analytics.setChecked(True)
+            sd2._submit_report()
+        finally:
+            sm.report.build_report = real_build2
+            sm.ReportDialog.exec = real_exec2
+        results["未配置地址时先问是否走 GitHub"] = (
+            bool(asked) and "配置" in asked[0] and not opened
+        )
+        sd2.deleteLater()
 
         # 收尾：把配置恢复成「已表态、关着」，与 main() 开头的基线一致，
         # 后面场景埋点时不会因为上一段测试的残留而改写统计库。
