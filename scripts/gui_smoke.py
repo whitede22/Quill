@@ -2486,7 +2486,9 @@ def main() -> int:
         #    结果是报红而不是把整轮卡在模态框上。
         asked: list[str] = []
         opened: list[int] = []
-        os.environ.pop("QUILL_REPORT_ENDPOINT", None)
+        # 默认地址已填，只有把环境变量置成空串才等于「没配」。删掉它只会退回
+        # 默认值，于是这一段测的就不是「未配置」而是「配好了」，判据会假红。
+        os.environ["QUILL_REPORT_ENDPOINT"] = ""
         sd2 = SettingsDialog({**window.config, "analytics_enabled": True}, "", window)
         real_build2 = sm.report.build_report
         real_exec2 = sm.ReportDialog.exec
@@ -2510,6 +2512,7 @@ def main() -> int:
             bool(asked) and "配置" in asked[0] and not opened
         )
         sd2.deleteLater()
+        os.environ.pop("QUILL_REPORT_ENDPOINT", None)
 
         # 收尾：把配置恢复成「已表态、关着」，与 main() 开头的基线一致，
         # 后面场景埋点时不会因为上一段测试的残留而改写统计库。

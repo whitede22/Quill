@@ -252,7 +252,9 @@ def check_report_submit(port: int) -> None:
             except report.SubmitError as exc:
                 check(f"{mode} 文案指向原因", expect in str(exc), str(exc))
 
-        os.environ.pop("QUILL_REPORT_ENDPOINT")
+        # 默认地址已填，置空环境变量才等于「这台机器上没有配」。删掉环境变量
+        # 只会退回 DEFAULT_ENDPOINT，那是一条能发信的真地址。
+        os.environ["QUILL_REPORT_ENDPOINT"] = ""
         try:
             report.submit(SAMPLE_REPORT, timeout=5.0)
             check("未配置地址应抛错", False, "未抛出")

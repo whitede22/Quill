@@ -27,10 +27,10 @@ from ..version import APP_VERSION, REPO_URL
 
 REPORT_SCHEMA_VERSION = 1
 
-# 部署完中转函数后把地址填在这里，见 server/report_relay/README.md。
+# 中转函数地址，见 server/report_relay/README.md。环境变量可覆盖，便于本地联调。
 # 留空时客户端会明确说「这个版本还没有配置提交地址」，不会静默失败。
-DEFAULT_ENDPOINT = ""
-DEFAULT_KEY = ""
+DEFAULT_ENDPOINT = "https://1520148882-hje75mqe62.ap-shanghai.tencentscf.com"
+DEFAULT_KEY = "Zf6b6iY2sMHu3a7JbopffNT1OEGbFtbo"
 
 SUBMIT_TIMEOUT = 25.0
 
