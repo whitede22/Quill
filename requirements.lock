@@ -7,12 +7,15 @@
 # 更新办法：在干净 venv 里按 requirements.txt 装好，跑完全部套件，再按实际
 # 装到的版本改这里。
 #
-# 注意 PySide6 只装 Essentials：QtCore / QtGui / QtWidgets / QtNetwork 与
-# QtPdf 都在其中，Addons（WebEngine、Multimedia 等）项目用不到，装上会让
-# 发布包白白大几百 MB。
+# 注意 PySide6 要装全：QtPdf 属于 Addons，PDF 导出与自检都直接 import 它，
+# 只装 Essentials 会在 `from PySide6.QtPdf import QPdfDocument` 上抛
+# ModuleNotFoundError。这一点在干净 venv 里才暴露得出来——开发机上残留着
+# 早先装过的文件，看起来一切正常。
 
 # ---------- 运行时 ----------
+PySide6==6.11.2
 PySide6_Essentials==6.11.2
+PySide6_Addons==6.11.2
 shiboken6==6.11.2
 httpx==0.28.1
 httpcore==1.0.9
