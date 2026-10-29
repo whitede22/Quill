@@ -70,6 +70,30 @@ _FTS_INSERT = (
 )
 
 
+def _write_params(entry: Entry, now: str) -> tuple:
+    """UPDATE 与 INSERT 共用的参数，顺序与两条语句的前 14 个占位列一致。
+
+    两条语句的列序必须同步改：这里少一项或多一项，写进去的就不是错位而是
+    sqlite3 的绑定数量异常，错误信息还落在调用行上，看不出是这里少写了一个。
+    """
+    return (
+        entry.lemma,
+        entry.phonetic,
+        entry.pos,
+        entry.definition_en,
+        entry.definition_zh,
+        entry.example,
+        entry.example_zh,
+        entry.synonyms_json(),
+        entry.collocations_json(),
+        entry.notes,
+        entry.tags,
+        entry.source,
+        entry.prompt_version,
+        now,
+    )
+
+
 def build_fts_query(raw: str) -> str:
     """把用户输入翻译为 FTS5 查询表达式。
 
@@ -178,85 +202,85 @@ class Repository:
         fresh_content = entry.id is None
         cur = self.conn.cursor()
         try:
-            row = cur.execute(
-                "SELECT id, created_at, notes, tags FROM entries WHERE lemma = ?",
-                (entry.lemma,),
-            ).fetchone()
-
-            if row and fresh_content:
-                # 接口回填：用户字段以库中现有值为准，并回写到内存对象上，
-                # 让界面渲染与索引同步都能看到「保留之后」的内容
-                entry.notes = row["notes"] or ""
-                entry.tags = row["tags"] or ""
-
-            params = (
-                entry.lemma,
-                entry.phonetic,
-                entry.pos,
-                entry.definition_en,
-                entry.definition_zh,
-                entry.example,
-                entry.example_zh,
-                entry.synonyms_json(),
-                entry.collocations_json(),
-                entry.notes,
-                entry.tags,
-                entry.source,
-                entry.prompt_version,
-                now,
-            )
-
+            row = self._fetch_existing(cur, entry, fresh_content)
+            params = _write_params(entry, now)
             if row:
-                entry.id = row["id"]
-                entry.created_at = row["created_at"]
-                entry.updated_at = now
-                cur.execute(
-                    """UPDATE entries SET lemma=?, phonetic=?, pos=?, definition_en=?,
-                       definition_zh=?, example=?, example_zh=?, synonyms_json=?,
-                       collocations_json=?, notes=?, tags=?, source=?, prompt_version=?,
-                       updated_at=? WHERE id=?""",
-                    params + (entry.id,),
-                )
+                self._update_row(cur, entry, row, params, now)
             else:
-                entry.created_at = now
-                entry.updated_at = now
-                # 复习计划在这里「播种」：新词条第一次进入生词本时，把它排进
-                # 「待复习」（review_due = now，立即到期）。这对应产品口径
-                # 「查词即收藏」——收藏的下一步就是复习，第一次复习（评分）
-                # 之后才由 SM-2 决定下一次间隔。
-                #
-                # 而撤销删除恢复的旧词条带着**复习历史**（review_count > 0 或
-                # review_due 非空），照原样保留——撤销不该重置记忆进度。所以
-                # 判据是「进来的 Entry 有没有复习历史」，而不是「这行是不是新建」。
-                seed_due = (
-                    entry.review_due
-                    if (entry.review_due or entry.review_count > 0)
-                    else now
-                )
-                cur.execute(
-                    """INSERT INTO entries
-                       (lemma, phonetic, pos, definition_en, definition_zh, example,
-                        example_zh, synonyms_json, collocations_json, notes, tags, source,
-                        prompt_version, updated_at, created_at, review_due,
-                        review_count, review_interval, review_ease)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    params
-                    + (
-                        now,
-                        seed_due,
-                        entry.review_count,
-                        entry.review_interval,
-                        entry.review_ease,
-                    ),
-                )
-                entry.id = cur.lastrowid
-
+                self._insert_row(cur, entry, params, now)
             self._sync_fts(entry)
         except Exception:
             self.conn.rollback()
             raise
         self.conn.commit()
         return entry
+
+    def _fetch_existing(self, cur, entry: Entry, fresh_content: bool):
+        """取库里同 lemma 的行，必要时把用户自有字段回写到 entry 上。
+
+        `fresh_content` 由调用方在回写 id 之前算好：它表达的是「这次写入带来的
+        是新内容」，不是「库里有没有这一行」。两者在读取-修改-写入场景下不同。
+        """
+        row = cur.execute(
+            "SELECT id, created_at, notes, tags FROM entries WHERE lemma = ?",
+            (entry.lemma,),
+        ).fetchone()
+        if row and fresh_content:
+            # 接口回填：用户字段以库中现有值为准，并回写到内存对象上，
+            # 让界面渲染与索引同步都能看到「保留之后」的内容
+            entry.notes = row["notes"] or ""
+            entry.tags = row["tags"] or ""
+        return row
+
+    def _update_row(
+        self, cur, entry: Entry, row, params: tuple, now: str
+    ) -> None:
+        """覆盖已有行。id 与 created_at 取自库，更新时间取本次。"""
+        entry.id = row["id"]
+        entry.created_at = row["created_at"]
+        entry.updated_at = now
+        cur.execute(
+            """UPDATE entries SET lemma=?, phonetic=?, pos=?, definition_en=?,
+               definition_zh=?, example=?, example_zh=?, synonyms_json=?,
+               collocations_json=?, notes=?, tags=?, source=?, prompt_version=?,
+               updated_at=? WHERE id=?""",
+            params + (entry.id,),
+        )
+
+    def _insert_row(self, cur, entry: Entry, params: tuple, now: str) -> None:
+        """插入新行，并在这里播种复习计划。"""
+        entry.created_at = now
+        entry.updated_at = now
+        # 复习计划在这里「播种」：新词条第一次进入生词本时，把它排进
+        # 「待复习」（review_due = now，立即到期）。这对应产品口径
+        # 「查词即收藏」——收藏的下一步就是复习，第一次复习（评分）
+        # 之后才由 SM-2 决定下一次间隔。
+        #
+        # 而撤销删除恢复的旧词条带着**复习历史**（review_count > 0 或
+        # review_due 非空），照原样保留——撤销不该重置记忆进度。所以
+        # 判据是「进来的 Entry 有没有复习历史」，而不是「这行是不是新建」。
+        seed_due = (
+            entry.review_due
+            if (entry.review_due or entry.review_count > 0)
+            else now
+        )
+        cur.execute(
+            """INSERT INTO entries
+               (lemma, phonetic, pos, definition_en, definition_zh, example,
+                example_zh, synonyms_json, collocations_json, notes, tags, source,
+                prompt_version, updated_at, created_at, review_due,
+                review_count, review_interval, review_ease)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            params
+            + (
+                now,
+                seed_due,
+                entry.review_count,
+                entry.review_interval,
+                entry.review_ease,
+            ),
+        )
+        entry.id = cur.lastrowid
 
     def _sync_fts(self, entry: Entry) -> None:
         """FTS 索引手工同步（索引表与 entries 表松耦合，便于整体重建）。

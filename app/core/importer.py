@@ -1149,27 +1149,11 @@ def run_import(
             on_progress(index, total, item.word)
 
         if item.kind == KIND_PHRASE:
-            try:
-                phrase, created = service.lookup_phrase(item.word)
-            except Exception as exc:  # noqa: BLE001 - 一条失败不该中断整批
-                outcome.failed.append((item.word, str(exc) or exc.__class__.__name__))
-                continue
-            if phrase is None or phrase.id is None:
-                outcome.failed.append((item.word, "查询没有返回词组"))
-                continue
-            (outcome.phrases_added if created else outcome.phrases_existing).append(
-                phrase.phrase
-            )
+            _import_phrase(service, item, outcome)
             continue
 
-        try:
-            entry, _cached = service.lookup(item.word)
-        except Exception as exc:  # noqa: BLE001 - 一个词失败不该中断整批导入
-            outcome.failed.append((item.word, str(exc) or exc.__class__.__name__))
-            continue
-
-        if entry is None or entry.id is None:
-            outcome.failed.append((item.word, "查询没有返回词条"))
+        entry = _lookup_word(service, item, outcome)
+        if entry is None:
             continue
         if entry.id in known:
             outcome.existing.append(item.word)
@@ -1177,27 +1161,69 @@ def run_import(
 
         known.add(entry.id)
         outcome.added.append(entry.lemma)
-        # 源文件里带备注或结构化字段（本程序导出的文件带备注，有道 XML 带释义
-        # 与音标）时补进去。
-        #
-        # 这里**不需要**再判一次「字段是否已有内容」——能走到这一行的都是本次
-        # 新增的词条（已有的在上面 `continue` 掉了）。新建行的字段由 lookup 填过，
-        # 但那属于**程序生成的内容**、不是用户数据：用文件里的值覆盖它，正是
-        # 「导入」的本意（用户要的就是文件里那份释义）。
-        # 这里曾经多写了一个 `not (entry.notes or "").strip()` 条件，它恒为真：
-        # 看着多守了一道，实际一个字节都没守住，还会让人以为「导入不覆盖备注」
-        # 这件事是在这条路径上被挡住的。变异测试就是靠「把它破坏掉却没有任何
-        # 测试报警」把这一点暴露出来的。
-        # 真正管住「不覆盖用户数据」的是上面那条 `entry.id in known` 分支，
-        # 以及 upsert 里对 notes / tags 的保留逻辑。
-        if item.notes or item.fill:
-            if item.notes:
-                entry.notes = item.notes
-                outcome.notes_restored += 1
-            for name, value in (item.fill or {}).items():
-                # **白名单在写入侧统一裁决**：解析侧只负责产出，将来新增一种
-                # 解析器时不会因为忘了过滤，就把 source 这类程序元数据写进库。
-                if name in _FILLABLE_FIELDS and value:
-                    setattr(entry, name, value)
-            repo.upsert(entry)
+        _apply_file_fields(repo, item, entry, outcome)
     return outcome
+
+
+def _import_phrase(service, item: ParsedWord, outcome: ImportOutcome) -> None:
+    """词组走 `lookup_phrase`，成败都记进 outcome。
+
+    新增与否取它自己给的返回值，不走 id 快照：词组的 id 属于另一张表，
+    与 `known` 那份 entries id 集合不可混用。
+    """
+    try:
+        phrase, created = service.lookup_phrase(item.word)
+    except Exception as exc:  # noqa: BLE001 - 一条失败不该中断整批
+        outcome.failed.append((item.word, str(exc) or exc.__class__.__name__))
+        return
+    if phrase is None or phrase.id is None:
+        outcome.failed.append((item.word, "查询没有返回词组"))
+        return
+    (outcome.phrases_added if created else outcome.phrases_existing).append(
+        phrase.phrase
+    )
+
+
+def _lookup_word(service, item: ParsedWord, outcome: ImportOutcome):
+    """查询单个词条。异常与空结果都记进 outcome，并返回 None 让调用方跳过。"""
+    try:
+        entry, _cached = service.lookup(item.word)
+    except Exception as exc:  # noqa: BLE001 - 一个词失败不该中断整批导入
+        outcome.failed.append((item.word, str(exc) or exc.__class__.__name__))
+        return None
+    if entry is None or entry.id is None:
+        outcome.failed.append((item.word, "查询没有返回词条"))
+        return None
+    return entry
+
+
+def _apply_file_fields(
+    repo: Repository, item: ParsedWord, entry: Entry, outcome: ImportOutcome
+) -> None:
+    """把源文件里的备注与结构化字段补进词条，有内容才落库。
+
+    源文件里带备注或结构化字段（本程序导出的文件带备注，有道 XML 带释义
+    与音标）时补进去。
+
+    这里**不需要**再判一次「字段是否已有内容」——能走到这一行的都是本次
+    新增的词条（已有的在调用方 `continue` 掉了）。新建行的字段由 lookup 填过，
+    但那属于**程序生成的内容**、不是用户数据：用文件里的值覆盖它，正是
+    「导入」的本意（用户要的就是文件里那份释义）。
+    这里曾经多写了一个 `not (entry.notes or "").strip()` 条件，它恒为真：
+    看着多守了一道，实际一个字节都没守住，还会让人以为「导入不覆盖备注」
+    这件事是在这条路径上被挡住的。变异测试就是靠「把它破坏掉却没有任何
+    测试报警」把这一点暴露出来的。
+    真正管住「不覆盖用户数据」的是调用方那条 `entry.id in known` 分支，
+    以及 upsert 里对 notes / tags 的保留逻辑。
+    """
+    if not (item.notes or item.fill):
+        return
+    if item.notes:
+        entry.notes = item.notes
+        outcome.notes_restored += 1
+    for name, value in (item.fill or {}).items():
+        # **白名单在写入侧统一裁决**：解析侧只负责产出，将来新增一种
+        # 解析器时不会因为忘了过滤，就把 source 这类程序元数据写进库。
+        if name in _FILLABLE_FIELDS and value:
+            setattr(entry, name, value)
+    repo.upsert(entry)
