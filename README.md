@@ -4,7 +4,7 @@
 
 生词都在自己电脑上的一个 `.db` 文件里，拷走就带走。换台机器不会什么都不剩。
 
-v1.3.4（2026-10-29）：提交报告那一块改用强调色标出，提交前要填一个称呼，可以再附一句建议。[下载免安装版](https://github.com/whitede22/Quill/releases/latest) · [更新记录](https://github.com/whitede22/Quill/blob/main/CHANGELOG.md)
+v1.3.4（2026-10-29）：提交报告那一块改用强调色标出，提交前要填一个称呼，可以再附一句建议。使用报告多记了查词来源、出错类别、复习的四档分布与打开次数。[下载免安装版](https://github.com/whitede22/Quill/releases/latest) · [更新记录](https://github.com/whitede22/Quill/blob/main/CHANGELOG.md)
 
 ## 界面预览
 
