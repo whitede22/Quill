@@ -14,8 +14,10 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -80,7 +82,10 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setMinimumWidth(460)
+        # 双栏之后宽度换成了高度：860 宽在 125% 缩放的 1080p 下仍有余量，
+        # 600 高给任务栏与标题栏留出位置。窄屏由最小尺寸兜底，不让两栏挤成残字。
+        self.setMinimumSize(760, 520)
+        self.resize(880, 600)
         self._config = dict(config)
         self._init_callbacks(on_theme_preview, on_restore, on_rebuild_index, config)
         # 提交在后台线程跑，期间禁用按钮，避免连点发出多封邮件。
@@ -91,6 +96,7 @@ class SettingsDialog(QDialog):
         offline_hint, storage = self._build_storage_notes()
         self._build_switches(config)
         self._build_analytics(config)
+        self._build_notice()
         self._build_actions()
         self._assemble(form, offline_hint, storage)
 
@@ -153,6 +159,7 @@ class SettingsDialog(QDialog):
         self._probe_note.setVisible(False)
 
     def _build_form(self, config: dict) -> QFormLayout:
+        """左栏的表单。窗口背景不在这里——它自成一块，右栏单独摆。"""
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setSpacing(10)
@@ -161,7 +168,7 @@ class SettingsDialog(QDialog):
         form.addRow("接口地址", self.base_url)
         form.addRow("模型名称", self.model)
         form.addRow("API 密钥", self.key_row)
-        form.addRow("窗口背景", self._build_background_row(config))
+        self._background = self._build_background_row(config)
         return form
 
     def _build_switches(self, config: dict) -> None:
@@ -192,10 +199,14 @@ class SettingsDialog(QDialog):
             self.tray.setToolTip("当前平台没有系统级热键，关闭窗口即退出程序。")
 
     def _build_analytics(self, config: dict) -> None:
-        """使用统计的开关与五个按钮。
+        """使用统计的开关与四个次要入口。
 
         开关和「删除统计」摆在一起：用户判断不了「到底记了什么」，但看得懂
         「有多少条、能不能删掉」。摘要与报告把前半句补上。
+
+        「提交报告」不在这排里。它跟这四个不是同一类动作：那四个都在本机发生，
+        它是唯一一个把数据送出去的。同级摆放的结果是它被当成第五个可选项，
+        所以单独做成一块，见 `_build_notice`。
         """
         self.analytics = QCheckBox("在这台电脑上记录使用情况（不上传）")
         self.analytics.setChecked(bool(config.get("analytics_enabled", False)))
@@ -211,7 +222,6 @@ class SettingsDialog(QDialog):
         for text, slot, tip in (
             ("查看摘要", self._show_summary, "这台电脑到目前为止记了多少条、都是哪几类。"),
             ("导出报告", self._export_report, "存成 JSON，位置由你选；文件里有什么会先列出来。"),
-            ("提交报告", self._submit_report, "存一份到本机，然后把报告发给作者；发送失败时本地这份还在。"),
             ("删除统计", self._clear_stats, "只删统计数据，词库、笔记、复习进度不受影响。"),
             ("隐私说明", self._show_privacy, "重新看一遍记录范围与用途。"),
         ):
@@ -219,10 +229,55 @@ class SettingsDialog(QDialog):
             button.setObjectName("bare")
             button.setToolTip(tip)
             button.clicked.connect(slot)
-            if slot == self._submit_report:
-                self._report_btn = button
             stat_layout.addWidget(button)
         stat_layout.addStretch(1)
+
+    def _build_notice(self) -> None:
+        """「提交报告」独立成块。
+
+        摆在一排次要按钮里的后果是：用户扫过去只看到五个一样大的词，而不明白
+        这一下会把东西发到别人的邮箱。标题写清去向，正文写清发什么、不发什么，
+        按钮换成主色，「先看看要发什么」留在旁边给不肯盲点的人。
+        """
+        notice = QFrame()
+        notice.setObjectName("notice")
+        layout = QHBoxLayout(notice)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(14)
+
+        text = QVBoxLayout()
+        text.setSpacing(3)
+        title = QLabel("把使用情况发给作者")
+        title.setObjectName("sectionTitle")
+        body = QLabel(
+            "发出统计摘要和一份 JSON 附件，不含生词、释义、笔记、剪贴板内容和密钥。"
+            "本机会留一份，不需要时可以删掉。"
+        )
+        body.setObjectName("muted")
+        body.setWordWrap(True)
+        text.addWidget(title)
+        text.addWidget(body)
+
+        self._report_btn = QPushButton("提交报告")
+        self._report_btn.setObjectName("primary")
+        self._report_btn.setToolTip(
+            "存一份到本机，然后把报告发给作者；发送失败时本地这份还在。"
+        )
+        self._report_btn.clicked.connect(self._submit_report)
+
+        peek = QPushButton("先看看要发什么")
+        peek.setObjectName("bare")
+        peek.setToolTip("打开摘要，看看这台电脑记了多少条、都是哪几类。")
+        peek.clicked.connect(self._show_summary)
+
+        actions = QVBoxLayout()
+        actions.setSpacing(0)
+        actions.addWidget(self._report_btn)
+        actions.addWidget(peek, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        layout.addLayout(text, 1)
+        layout.addLayout(actions)
+        self._notice = notice
 
     def _build_storage_notes(self) -> tuple[QLabel, QLabel]:
         """离线词库与密钥存储两条说明，内容都来自运行时探测。"""
@@ -291,10 +346,56 @@ class SettingsDialog(QDialog):
         self.btn_tutorial.setToolTip("重新打开首次启动时的欢迎页与上手教程。")
         self.btn_tutorial.clicked.connect(self._show_tutorial)
 
+    @staticmethod
+    def _section_label(text: str) -> QLabel:
+        """栏头的分区标题。与详情区的 section 共用同一条样式。"""
+        label = QLabel(text)
+        label.setObjectName("sectionTitle")
+        return label
+
+    def _build_bottom_bar(self) -> QWidget:
+        """统计的开关与入口、维护三件事，同一行左右分列。
+
+        这两组都不常用，但性质不同：左边看和清统计，右边修数据。上下堆叠时
+        各自只占半行宽，却各要一整行高度，是这次纵向压缩里最划算的一处。
+        """
+        holder = QWidget()
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(20)
+
+        stats = QVBoxLayout()
+        stats.setSpacing(2)
+        stats.addWidget(self.analytics)
+        stats.addWidget(self.analytics_row)
+
+        tools = QVBoxLayout()
+        tools.setSpacing(2)
+        tools.addStretch(1)
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(6)
+        # 靠右收边：自检与截图脚本没有恢复/重建的回调，只剩「重新查看教程」
+        # 一个按钮，靠左会悬在栏中间，看着像漏了东西。
+        tools_row.addStretch(1)
+        for button in (self.btn_restore, self.btn_rebuild_index, self.btn_tutorial):
+            tools_row.addWidget(button)
+        tools.addLayout(tools_row)
+        tools.addWidget(self._rebuild_note)
+        tools.addStretch(1)
+
+        layout.addLayout(stats, 3)
+        layout.addLayout(tools, 2)
+        return holder
+
     def _assemble(
         self, form: QFormLayout, offline_hint: QLabel, storage: QLabel
     ) -> None:
-        """按固定顺序装配，并接上最后三个信号。"""
+        """装配并接上最后三个信号。
+
+        分成两栏是因为这些内容本来就不是一条链：左边是「怎么查到词」，右边是
+        「看起来什么样、词库在哪」。单列排下来要 990 高，超过不少笔记本的
+        可用高度，而两栏各自都在 320 上下。
+        """
         hint = QLabel(
             "任何兼容 OpenAI 协议的服务都能接入：OpenAI、DeepSeek、Moonshot、"
             "通义、智谱，或本机的 Ollama / vLLM 等。\n"
@@ -305,6 +406,28 @@ class SettingsDialog(QDialog):
         hint.setObjectName("muted")
         hint.setWordWrap(True)
 
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        left.addWidget(self._section_label("模型接入"))
+        left.addLayout(form)
+        left.addWidget(hint)
+        left.addWidget(self.fallback)
+        left.addWidget(self.tray)
+        left.addStretch(1)
+
+        right = QVBoxLayout()
+        right.setSpacing(10)
+        right.addWidget(self._section_label("窗口背景"))
+        right.addWidget(self._background)
+        right.addWidget(offline_hint)
+        right.addWidget(storage)
+        right.addStretch(1)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(24)
+        columns.addLayout(left, 1)
+        columns.addLayout(right, 1)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -314,23 +437,13 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setContentsMargins(20, 18, 20, 14)
         layout.setSpacing(12)
-        layout.addLayout(form)
-        layout.addWidget(self.fallback)
-        layout.addWidget(self.tray)
-        layout.addWidget(self.analytics)
-        layout.addWidget(self.analytics_row)
-        layout.addWidget(hint)
-        layout.addWidget(offline_hint)
-        layout.addWidget(storage)
-        layout.addWidget(self.btn_restore)
-        layout.addWidget(self.btn_rebuild_index)
-        layout.addWidget(self._rebuild_note)
-        layout.addWidget(self.btn_tutorial)
+        layout.addLayout(columns, 1)
+        layout.addWidget(self._notice)
+        layout.addWidget(self._build_bottom_bar())
         layout.addWidget(self._probe_note)
         layout.addWidget(self._error)
-        layout.addSpacing(4)
         layout.addWidget(buttons)
 
         self.btn_test.clicked.connect(self._test_connection)
@@ -500,6 +613,10 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
+        # 下拉 + 说明装在一个 holder 里，QFormLayout 拿到的行高就变成 holder 的
+        # 最小尺寸；QComboBox 的最小高度只有十来像素，空间一紧就被压成一条线。
+        # 钉住最小值，压缩落到别的行上去。
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         self.theme = QComboBox()
         for theme_id in theme_ids():

@@ -517,6 +517,14 @@ QListWidget {
     outline: none;
 }
 
+/* 设置里「提交报告」的独立区域。它与生词卡片的区别在**没有悬停变化**：这个
+   框不是可点区域，整块高亮等于承诺一个不存在的点击。 */
+QFrame#notice {
+    background: $surface;
+    border: 1px solid $border;
+    border-radius: $radius_container;
+}
+
 /* 卡片刻意保持**不透明**：列表项文字是透明画的、一直靠卡片盖住它。卡片一透
    就成鬼影；消除鬼影要把文字改透明，会毁掉无障碍与测试读「这一行是什么」的
    能力。有反向断言守这条。 */
