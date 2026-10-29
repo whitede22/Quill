@@ -82,10 +82,10 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
-        # 双栏之后宽度换成了高度：860 宽在 125% 缩放的 1080p 下仍有余量，
-        # 600 高给任务栏与标题栏留出位置。窄屏由最小尺寸兜底，不让两栏挤成残字。
-        self.setMinimumSize(760, 520)
-        self.resize(880, 600)
+        # 双栏之后宽度换成了高度：880 宽在 125% 缩放的 1080p 下仍有余量，
+        # 630 高对得上内容的实际需求，也不再让布局去压缩任何一行。
+        self.setMinimumSize(760, 560)
+        self.resize(880, 630)
         self._config = dict(config)
         self._init_callbacks(on_theme_preview, on_restore, on_rebuild_index, config)
         # 提交在后台线程跑，期间禁用按钮，避免连点发出多封邮件。
@@ -242,8 +242,8 @@ class SettingsDialog(QDialog):
         notice = QFrame()
         notice.setObjectName("notice")
         layout = QHBoxLayout(notice)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(14)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(16)
 
         text = QVBoxLayout()
         text.setSpacing(3)
@@ -384,6 +384,12 @@ class SettingsDialog(QDialog):
         tools.addStretch(1)
 
         layout.addLayout(stats, 3)
+        # 两组的动作性质不同（看和清统计 / 修数据），中间立一条竖线分界，
+        # 不然在浅色下只是两串小字并排，读起来像同一组。
+        divider = QLabel()
+        divider.setObjectName("divider")
+        divider.setFixedWidth(1)
+        layout.addWidget(divider)
         layout.addLayout(tools, 2)
         return holder
 
