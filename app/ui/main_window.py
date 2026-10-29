@@ -2191,6 +2191,34 @@ class MainWindow(QMainWindow):
         self._flush_edits()
         self._import_origin = "导入"
 
+        merged, detail_lines, failed_lines, recognized, recognized_phrases = (
+            self._merge_paths(paths)
+        )
+        words = list(merged.values())
+        if not words:
+            self._warn_nothing_recognized(paths, detail_lines, failed_lines)
+            return
+
+        lines = self._import_summary(
+            paths, words, detail_lines, failed_lines, recognized, recognized_phrases
+        )
+        if (
+            QMessageBox.question(
+                self,
+                "导入生词表",
+                "\n".join(lines),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self._start_import(ParseResult(words=words, total_lines=recognized))
+
+    def _merge_paths(
+        self, paths: list[Path]
+    ) -> tuple[dict[str, ParsedWord], list[str], list[str], int, int]:
+        """读全部文件并按「东西本身」去重，返回合并结果与四组计数。"""
         merged: dict[str, ParsedWord] = {}
         detail_lines: list[str] = []
         failed_lines: list[str] = []
@@ -2214,18 +2242,29 @@ class MainWindow(QMainWindow):
                 # 而不是按字符串——将来若允许一条词组与某个词同形，这里不会
                 # 悄悄替用户丢掉一条。
                 merged.setdefault(f"{item.kind}:{item.word.lower()}", item)
+        return merged, detail_lines, failed_lines, recognized, recognized_phrases
 
-        words = list(merged.values())
-        if not words:
-            QMessageBox.information(
-                self,
-                "导入",
-                "这次拖入的 "
-                f"{len(paths)} 个文件里没有认出任何单词或词组。\n\n"
-                + "\n".join(detail_lines + failed_lines),
-            )
-            return
+    def _warn_nothing_recognized(
+        self, paths: list[Path], detail_lines: list[str], failed_lines: list[str]
+    ) -> None:
+        QMessageBox.information(
+            self,
+            "导入",
+            "这次拖入的 "
+            f"{len(paths)} 个文件里没有认出任何单词或词组。\n\n"
+            + "\n".join(detail_lines + failed_lines),
+        )
 
+    def _import_summary(
+        self,
+        paths: list[Path],
+        words: list[ParsedWord],
+        detail_lines: list[str],
+        failed_lines: list[str],
+        recognized: int,
+        recognized_phrases: int,
+    ) -> list[str]:
+        """核对框的正文：认了多少、每个文件各多少、跨文件合并了几条。"""
         lines = [
             f"这次拖入 {len(paths)} 个文件，共认出 {recognized} 条"
             f"（单词 {recognized - recognized_phrases} 条 · "
@@ -2241,23 +2280,11 @@ class MainWindow(QMainWindow):
         lines.append(f"实际要收录 {len(words)} 条。")
         if recognized_phrases and self._phrase_blocked_reason():
             lines.append(
-                f"\n注意：当前用的是本机离线词库，不含词组，"
-                f"词组会被记为未能收录。要收词组请先到「设置」接上接口。"
+                "\n注意：当前用的是本机离线词库，不含词组，"
+                "词组会被记为未能收录。要收词组请先到「设置」接上接口。"
             )
         lines.append("\n现在开始收录吗？已经收过的会自动跳过。")
-
-        if (
-            QMessageBox.question(
-                self,
-                "导入生词表",
-                "\n".join(lines),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
-            )
-            != QMessageBox.StandardButton.Yes
-        ):
-            return
-        self._start_import(ParseResult(words=words, total_lines=recognized))
+        return lines
 
     def _import_path(self, path: Path) -> None:
         """导入一个文件。读不动、认不出词都在这里收住并说明原因。"""
@@ -2681,15 +2708,10 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        entries = self._current_entries(unlimited=dialog.unlimited)
-        if dialog.filtered_only and query:
-            # 对话框里选的是「跟随当前筛选」，而 `_current_entries` 本来就跟随
-            # 筛选框，这里无需额外过滤；保留分支是为了将来「筛选外的范围」扩展。
-            entries = [e for e in entries if e.lemma]
+        entries = self._collect_export_entries(dialog, query)
         if not entries:
             QMessageBox.information(self, "导出", "当前没有可导出的内容。")
             return
-
         # 导出以字母序排版，便于打印后查阅；列表顺序是浏览用的，不适用于纸质版
         entries = sorted(entries, key=lambda item: item.lemma.lower())
 
@@ -2699,6 +2721,34 @@ class MainWindow(QMainWindow):
             (k, lab, h, e) for k, lab, h, e in EXPORT_FORMATS if k == dialog.format_key
         )
 
+        path = self._ask_export_path(key, label, default_title, ext)
+        if not path:
+            return
+        if not self._write_export_guarded(key, entries, title, path):
+            return
+
+        # 格式与条数足够判断「哪种导出真有人用」，路径与文件名不进统计。
+        analytics.record_event(
+            "export_completed", {"format": key, "count": len(entries)}
+        )
+        self.statusBar().showMessage(f"已导出 {len(entries)} 条")
+        self._offer_open_export(key, entries, query, path)
+
+    def _collect_export_entries(
+        self, dialog: ExportDialog, query: str
+    ) -> list[Entry]:
+        """按对话框选定的范围取词条。"""
+        entries = self._current_entries(unlimited=dialog.unlimited)
+        if dialog.filtered_only and query:
+            # 对话框里选的是「跟随当前筛选」，而 `_current_entries` 本来就跟随
+            # 筛选框，这里无需额外过滤；保留分支是为了将来「筛选外的范围」扩展。
+            entries = [e for e in entries if e.lemma]
+        return entries
+
+    def _ask_export_path(
+        self, key: str, label: str, default_title: str, ext: str
+    ) -> str:
+        """问保存位置。返回空串表示用户取消。"""
         # 单词表与纯文本同为 .txt。默认文件名必须区分开，否则同一目录下第二次
         # 导出会弹出「已存在，是否覆盖」，而用户以为自己导的是另一种格式。
         name_suffix = "_单词表" if key == "wordlist" else ""
@@ -2714,47 +2764,55 @@ class MainWindow(QMainWindow):
             "anki": "Anki 卡片 (*.txt)",
             "json": "JSON (*.json)",
         }[key]
-        path, _ = QFileDialog.getSaveFileName(self, f"导出为{label}", suggested, filters)
-        if not path:
-            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"导出为{label}", suggested, filters
+        )
+        return path
 
+    def _write_export_guarded(
+        self, key: str, entries: list[Entry], title: str, path: str
+    ) -> bool:
+        """写盘并把两种已知失败就地说明。返回是否写成功。"""
         try:
             self._write_export(key, entries, title, Path(path))
         except OSError as exc:
             QMessageBox.warning(self, "导出失败", f"无法写入文件：{exc}")
-            return
+            return False
         except PdfFontUnavailable as exc:
             # 字体缺失时程序不会静默产出一份通篇方块的 PDF，而是走到这里。
             # 这条消息必须说清「是环境的问题、不是你的词条有问题」，否则用户
             # 会开始怀疑数据。
             QMessageBox.warning(self, "无法导出 PDF", str(exc))
-            return
+            return False
+        return True
 
-        # 格式与条数足够判断「哪种导出真有人用」，路径与文件名不进统计。
-        analytics.record_event(
-            "export_completed", {"format": key, "count": len(entries)}
-        )
-        self.statusBar().showMessage(f"已导出 {len(entries)} 条")
-        scope = "（当前筛选结果）" if query else ""
-        extra = ""
+    def _export_extra_note(self, key: str) -> str:
+        """完成提示里的格式说明，按格式各说一句它会损失什么。"""
         if key == "csv":
-            extra = "\n\n已写入 BOM，Excel 打开不会乱码。同义语被压在一格里，是有损的。"
-        elif key == "json":
-            extra = "\n\n不含本机的编号与时间戳，可以安全地拷到别的机器。"
-        elif key == "anki":
-            extra = (
+            return "\n\n已写入 BOM，Excel 打开不会乱码。同义语被压在一格里，是有损的。"
+        if key == "json":
+            return "\n\n不含本机的编号与时间戳，可以安全地拷到别的机器。"
+        if key == "anki":
+            return (
                 "\n\n开头几行 `#` 是给 Anki 认的指令（分隔符、富文本、标签列），"
                 "它导入时会自己读掉；用别的方式打开时删掉那几行即可。"
             )
-        elif key == "wordlist":
+        if key == "wordlist":
             # 这里必须把「它不是备份」说清楚：两种 .txt 摆在同一个对话框里，
             # 用户很容易拿单词表当备份，等换机器时才发现例句与搭配都没了。
-            extra = (
+            return (
                 "\n\n只有单词与中文释义两列，没有标题也没有表尾，"
                 "整份文件可以再导回来。\n"
                 "它不是备份：音标、例句、搭配、备注都没有带上，"
                 "要完整备份请用 JSON。"
             )
+        return ""
+
+    def _offer_open_export(
+        self, key: str, entries: list[Entry], query: str, path: str
+    ) -> None:
+        scope = "（当前筛选结果）" if query else ""
+        extra = self._export_extra_note(key)
         if (
             QMessageBox.question(
                 self,

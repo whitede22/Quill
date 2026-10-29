@@ -82,18 +82,35 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("设置")
         self.setMinimumWidth(460)
         self._config = dict(config)
-        # 「从备份恢复」需要一个能关闭数据库连接的地方，而那只有 main 有。
-        # 回调为 None 时（自检、截图脚本）不显示这个按钮，而不是显示一个点了
-        # 只报错的按钮。
+        self._init_callbacks(on_theme_preview, on_restore, on_rebuild_index, config)
+        self._build_provider_fields(config, api_key)
+        form = self._build_form(config)
+        offline_hint, storage = self._build_storage_notes()
+        self._build_switches(config)
+        self._build_analytics(config)
+        self._build_actions()
+        self._assemble(form, offline_hint, storage)
+
+    def _init_callbacks(
+        self, on_theme_preview, on_restore, on_rebuild_index, config: dict
+    ) -> None:
+        """把只有主窗口才有的能力接进来。为 None 时对应的按钮不出现。
+
+        「从备份恢复」需要一个能关闭数据库连接的地方，「重建搜索索引」要拿仓储
+        连接并提交事务，主题即时预览要重绘主窗口——这三件事都只有 main 有。
+        回调为 None 时（自检、截图脚本）不显示按钮，而不是显示一个点了只报错的
+        按钮。
+        """
         self._on_restore = on_restore
-        # 「重建搜索索引」要拿仓储连接并提交事务，同样只有主窗口有。回调返回
-        # 重建后的条数，失败则抛异常，由这里就地显示结果。
+        # 回调返回重建后的条数，失败则抛异常，由这里就地显示结果。
         self._on_rebuild_index = on_rebuild_index
-        # 主题即时预览用的回调，由主窗口注入。默认 None 时退化成「保存后才生效」，
-        # 这样自检 / 截图脚本沿用旧调用方式也不会坏。
+        # 默认 None 时退化成「保存后才生效」，这样自检 / 截图脚本沿用旧调用
+        # 方式也不会坏。
         self._on_theme_preview = on_theme_preview
         self._theme_original = theme_id_of(config.get("theme"))
 
+    def _build_provider_fields(self, config: dict, api_key: str) -> None:
+        """接入方式、地址、模型名、密钥与「测试连接」。"""
         self.mode = QComboBox()
         self.mode.addItem("OpenAI 兼容接口", "openai-compat")
         self.mode.addItem("离线词典（不联网，查本地词库）", "offline")
@@ -103,7 +120,8 @@ class SettingsDialog(QDialog):
 
         self.base_url = QLineEdit(config.get("base_url", ""))
         # 占位提示只写「到版本号为止」这一条规则，不写死某家厂商的地址：
-        # 填 OpenAI 还是 DeepSeek 都合法，写死一家会让另一家的用户以为不能填自己那家。
+        # 填 OpenAI 还是 DeepSeek 都合法，写死一家会让另一家的用户以为不能填
+        # 自己那家。
         self.base_url.setPlaceholderText("https://api.deepseek.com/v1")
         self.model = QLineEdit(config.get("model", ""))
         self.model.setPlaceholderText("deepseek-chat")
@@ -119,8 +137,8 @@ class SettingsDialog(QDialog):
         self.btn_test.setToolTip(
             "发一个最小请求（只花 1 个 token），确认地址、密钥与模型名真的能用。"
         )
-        key_row = QWidget()
-        key_layout = QHBoxLayout(key_row)
+        self.key_row = QWidget()
+        key_layout = QHBoxLayout(self.key_row)
         key_layout.setContentsMargins(0, 0, 0, 0)
         key_layout.setSpacing(6)
         key_layout.addWidget(self.api_key, 1)
@@ -131,6 +149,7 @@ class SettingsDialog(QDialog):
         self._probe_note.setWordWrap(True)
         self._probe_note.setVisible(False)
 
+    def _build_form(self, config: dict) -> QFormLayout:
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setSpacing(10)
@@ -138,19 +157,12 @@ class SettingsDialog(QDialog):
         form.addRow("接入方式", self.mode)
         form.addRow("接口地址", self.base_url)
         form.addRow("模型名称", self.model)
-        form.addRow("API 密钥", key_row)
+        form.addRow("API 密钥", self.key_row)
         form.addRow("窗口背景", self._build_background_row(config))
+        return form
 
-        hint = QLabel(
-            "任何兼容 OpenAI 协议的服务都能接入：OpenAI、DeepSeek、Moonshot、"
-            "通义、智谱，或本机的 Ollama / vLLM 等。\n"
-            "地址填到版本号为止（如 https://api.deepseek.com/v1），"
-            "程序会自动补全 /chat/completions。\n"
-            "具体地址与模型名以你所选服务商的文档为准。"
-        )
-        hint.setObjectName("muted")
-        hint.setWordWrap(True)
-
+    def _build_switches(self, config: dict) -> None:
+        """两个行为开关：接口兜底与托盘常驻。"""
         self.fallback = QCheckBox("接口请求失败时，自动改用离线词库")
         self.fallback.setChecked(bool(config.get("offline_fallback", True)))
         self.fallback.setToolTip(
@@ -176,9 +188,12 @@ class SettingsDialog(QDialog):
             self.tray.setText("关闭窗口后留在托盘（仅 Windows 支持全局热键）")
             self.tray.setToolTip("当前平台没有系统级热键，关闭窗口即退出程序。")
 
-        # ---- 使用统计与反馈 ----
-        # 开关和「删除统计」摆在一起：用户判断不了「到底记了什么」，但看得懂
-        # 「有多少条、能不能删掉」。摘要与报告把前半句补上。
+    def _build_analytics(self, config: dict) -> None:
+        """使用统计的开关与五个按钮。
+
+        开关和「删除统计」摆在一起：用户判断不了「到底记了什么」，但看得懂
+        「有多少条、能不能删掉」。摘要与报告把前半句补上。
+        """
         self.analytics = QCheckBox("在这台电脑上记录使用情况（不上传）")
         self.analytics.setChecked(bool(config.get("analytics_enabled", False)))
         self.analytics.setToolTip(
@@ -204,6 +219,8 @@ class SettingsDialog(QDialog):
             stat_layout.addWidget(button)
         stat_layout.addStretch(1)
 
+    def _build_storage_notes(self) -> tuple[QLabel, QLabel]:
+        """离线词库与密钥存储两条说明，内容都来自运行时探测。"""
         # 离线词库的规模直接摆在设置里：用户要先知道「本地这本词典有多少词」，
         # 才能判断该不该切过去，而不是切过去发现查不到再生疑。
         offline = resolve_offline_dict()
@@ -224,7 +241,10 @@ class SettingsDialog(QDialog):
         )
         storage.setObjectName("muted")
         storage.setWordWrap(True)
+        return offline_hint, storage
 
+    def _build_actions(self) -> None:
+        """恢复、重建索引、重新看教程，以及两条就地显示的提示。"""
         # 备份按钮在主工具栏，恢复放这里：恢复会覆盖数据，不该和「备份」并排
         # 摆成一个手快点错的位置。
         self.btn_restore = QPushButton("从备份恢复…")
@@ -233,7 +253,7 @@ class SettingsDialog(QDialog):
             "用一份 .db 备份覆盖当前生词本。覆盖前会自动把当前数据另存一份。"
         )
         self.btn_restore.clicked.connect(self._restore_backup)
-        self.btn_restore.setVisible(on_restore is not None)
+        self.btn_restore.setVisible(self._on_restore is not None)
 
         # 索引与词条表是两份数据，靠写入时手工同步。同步漏了不会报错，只是搜不到，
         # 所以给一个用户自己就能按的按钮，不必等维护者。词条内容一个都不会变，
@@ -245,7 +265,7 @@ class SettingsDialog(QDialog):
             "不改动任何词条内容。"
         )
         self.btn_rebuild_index.clicked.connect(self._rebuild_index)
-        self.btn_rebuild_index.setVisible(on_rebuild_index is not None)
+        self.btn_rebuild_index.setVisible(self._on_rebuild_index is not None)
 
         # 结果就地显示，与校验提示同一个道理：弹窗会把设置对话框关掉
         self._rebuild_note = QLabel()
@@ -265,6 +285,20 @@ class SettingsDialog(QDialog):
         self.btn_tutorial.setObjectName("bare")
         self.btn_tutorial.setToolTip("重新打开首次启动时的欢迎页与上手教程。")
         self.btn_tutorial.clicked.connect(self._show_tutorial)
+
+    def _assemble(
+        self, form: QFormLayout, offline_hint: QLabel, storage: QLabel
+    ) -> None:
+        """按固定顺序装配，并接上最后三个信号。"""
+        hint = QLabel(
+            "任何兼容 OpenAI 协议的服务都能接入：OpenAI、DeepSeek、Moonshot、"
+            "通义、智谱，或本机的 Ollama / vLLM 等。\n"
+            "地址填到版本号为止（如 https://api.deepseek.com/v1），"
+            "程序会自动补全 /chat/completions。\n"
+            "具体地址与模型名以你所选服务商的文档为准。"
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
@@ -297,7 +331,6 @@ class SettingsDialog(QDialog):
         self.btn_test.clicked.connect(self._test_connection)
         self.mode.currentIndexChanged.connect(self._sync_enabled)
         self._sync_enabled()
-
     # ---------- 使用统计与反馈 ----------
 
     def _current_theme(self) -> str:
