@@ -423,10 +423,10 @@ ABLATIONS: list[tuple[str, str, str, str, str]] = [
         "查词即收藏的同时，新词要被排进「待复习」——否则复习入口永远显示 0，"
         "复习功能等于白做。抽走后新词不再播种 review_due，待复习计数一直是 0",
         "app/core/repository.py",
-        "                    if (entry.review_due or entry.review_count > 0)\n"
-        "                    else now\n",
-        "                    if (entry.review_due or entry.review_count > 0)\n"
-        '                    else ""  # 消融：新词不再进入复习计划\n',
+        "            if (entry.review_due or entry.review_count > 0)\n"
+        "            else now\n",
+        "            if (entry.review_due or entry.review_count > 0)\n"
+        '            else ""  # 消融：新词不再进入复习计划\n',
     ),
 ]
 
