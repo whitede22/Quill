@@ -6,7 +6,7 @@
 
 [project]
 name = "quill"
-version = "1.3.2"
+version = "1.3.3"
 description = "本地优先的英语生词本桌面程序"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -4,7 +4,7 @@
 
 生词都在自己电脑上的一个 `.db` 文件里，拷走就带走。换台机器不会什么都不剩。
 
-v1.3.2（2026-10-29）：设置页可以直接提交使用报告，不必再到 GitHub 上建 Issue。发信凭据留在服务端，客户端只发一个请求。[下载免安装版](https://github.com/whitede22/Quill/releases/latest) · [更新记录](https://github.com/whitede22/Quill/blob/main/CHANGELOG.md)
+v1.3.3（2026-10-29）：设置页改成两栏，一屏放得下全部设置项。提交报告从一排小按钮里单独拿出来，写明发出什么、不含什么。[下载免安装版](https://github.com/whitede22/Quill/releases/latest) · [更新记录](https://github.com/whitede22/Quill/blob/main/CHANGELOG.md)
 
 ## 界面预览
 
@@ -26,7 +26,7 @@ v1.3.2（2026-10-29）：设置页可以直接提交使用报告，不必再到 
 
 ![设置校验提示](preview_settings.png)
 
-设置框在保存前就地校验，填错只在底部指出，对话框不关。上方是主题与背景，下方是统计开关。
+设置框在保存前就地校验，填错只在底部指出，对话框不关。左栏接模型、右栏管背景，提交报告单独占一块。
 
 ![接口失败兜底](preview_fallback.png)
 

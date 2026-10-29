@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 
 # 仓库地址。报告提交、README 链接、Issue 模板都从这里取，避免同一串地址
 # 在代码里出现多份——换仓库时只改一处。
