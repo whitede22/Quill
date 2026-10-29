@@ -93,8 +93,9 @@ def _client_ip(event: dict) -> str:
     forwarded = headers.get("x-forwarded-for", "")
     if forwarded:
         return forwarded.split(",")[0].strip()
+    # 函数 URL 把来源 IP 放在 requestContext 顶层，API 网关放在 identity 里，两处都认。
     ctx = event.get("requestContext") or {}
-    return str((ctx.get("identity") or {}).get("sourceIp", "unknown"))
+    return str(ctx.get("sourceIp") or (ctx.get("identity") or {}).get("sourceIp") or "unknown")
 
 
 def _rate_ok(ip: str) -> bool:
@@ -160,11 +161,30 @@ def _recipients() -> list[str]:
 
 
 def _send(message: EmailMessage) -> None:
+    """发信。465 走 SSL，其余端口按 STARTTLS 处理。
+
+    两种都要支持：QQ、163 用 465，Office 365 与多数企业邮箱用 587，
+    而 587 只接受 STARTTLS。写死 SMTP_SSL 在 587 上会握手失败。
+    """
     host = os.environ.get("SMTP_HOST", "smtp.qq.com")
     port = int(os.environ.get("SMTP_PORT", "465"))
-    with smtplib.SMTP_SSL(host, port, timeout=20) as client:
+    with _connect(host, port) as client:
         client.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
         client.send_message(message)
+
+
+def _connect(host: str, port: int) -> smtplib.SMTP:
+    if port == 465:
+        return smtplib.SMTP_SSL(host, port, timeout=30)
+    client = smtplib.SMTP(host, port, timeout=30)
+    try:
+        client.ehlo()
+        client.starttls()
+        client.ehlo()
+    except Exception:
+        client.close()
+        raise
+    return client
 
 
 def _reply(status: int, payload: dict) -> dict:

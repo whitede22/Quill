@@ -7,8 +7,8 @@ Quill 客户端点「提交报告」时，把 JSON 发到这个函数，函数�
 
 | 名称 | 说明 |
 |---|---|
-| `SMTP_HOST` | 默认 `smtp.qq.com`，可以不填 |
-| `SMTP_PORT` | 默认 `465`，SSL |
+| `SMTP_HOST` | SMTP 服务器地址。默认 `smtp.qq.com`，用别的邮箱要改 |
+| `SMTP_PORT` | 默认 `465`，走 SSL；填 `587` 时自动改用 STARTTLS |
 | `SMTP_USER` | 发件邮箱，例如 `someone@qq.com` |
 | `SMTP_PASS` | 邮箱授权码，在邮箱设置里开启 SMTP 后生成，不是登录密码 |
 | `MAIL_TO` | 收件邮箱，多个用逗号分隔 |
@@ -18,7 +18,7 @@ Quill 客户端点「提交报告」时，把 JSON 发到这个函数，函数�
 
 1. 腾讯云控制台进入「云函数」，新建函数，运行环境选 Python 3.10，选「从头开始」。
 2. 函数入口填 `main.main_handler`，把本目录的 `main.py` 内容贴进在线编辑器。
-3. 执行超时改为 30 秒，内存 128 MB 够用。
+3. 执行超时改为 60 秒，内存 128 MB 够用。默认的 3 秒不够：SMTP 握手在部分线路上要十几秒。
 4. 在函数配置里添加上面六项环境变量。
 5. 开启「函数 URL」，鉴权方式选不鉴权。函数自己校验 `REPORT_KEY`，腾讯云那层鉴权会让桌面客户端多一次签名流程，没有必要。
 6. 复制函数 URL，填进客户端的 `app/core/report.py` 里 `DEFAULT_ENDPOINT`。

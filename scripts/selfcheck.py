@@ -5869,12 +5869,54 @@ def main() -> int:
             str(_burst),
         )
 
+        # 函数 URL 把来源 IP 放在 requestContext 顶层，API 网关放在 identity 里。
+        # 只认后者时所有人都会落到同一个桶，四个人各发一次就有人被误挡。
+        check(
+            "中转认得函数 URL 的来源 IP",
+            _relay._client_ip({"requestContext": {"sourceIp": "9.9.9.9"}}) == "9.9.9.9",
+            _relay._client_ip({"requestContext": {"sourceIp": "9.9.9.9"}}),
+        )
+
         def _broken(_message):
             raise OSError("smtp 不通")
 
         _relay._send = _broken
         check("发信失败返回 502", _call(_good, ip="10.1.0.10")["statusCode"] == 502)
         _relay._send = _real_send
+
+        # 端口决定协议：465 走 SSL，其余走 STARTTLS。占位实现把两者混用会在这里变红。
+        import smtplib as _smtplib
+
+        _ssl_ports: list[int] = []
+        _tls_steps: list[str] = []
+
+        class _FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                _tls_steps.append("connect")
+
+            def ehlo(self):
+                _tls_steps.append("ehlo")
+
+            def starttls(self):
+                _tls_steps.append("starttls")
+
+            def close(self):
+                pass
+
+        class _FakeSSL(_FakeSMTP):
+            def __init__(self, host, port, timeout=None):
+                _ssl_ports.append(port)
+
+        _real_clients = (_smtplib.SMTP, _smtplib.SMTP_SSL)
+        _smtplib.SMTP, _smtplib.SMTP_SSL = _FakeSMTP, _FakeSSL
+        try:
+            _relay._connect("smtp.example.com", 465)
+            _relay._connect("smtp.example.com", 587)
+        finally:
+            _smtplib.SMTP, _smtplib.SMTP_SSL = _real_clients
+
+        check("中转在 465 端口用 SSL", _ssl_ports == [465], str(_ssl_ports))
+        check("中转在 587 端口用 STARTTLS", _tls_steps.count("starttls") == 1, str(_tls_steps))
     except Exception as exc:  # noqa: BLE001
         check("中转函数检查可执行", False, str(exc))
     finally:
