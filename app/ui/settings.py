@@ -764,7 +764,8 @@ class SettingsDialog(QDialog):
         self.bg_blur.setChecked(bool(config.get("background_blur", True)))
         self.bg_blur.setToolTip(
             "开启后背景图会被模糊，作为氛围而不是照片；\n"
-            "关掉则原图直出，适合本身就很淡的图。"
+            "关掉则原图直出，适合本身就很淡的图。\n"
+            "图案很碎（照片、截图）时会自动补上模糊，免得花纹跟正文抢字。"
         )
         layout.addWidget(self.bg_blur)
 
@@ -852,9 +853,13 @@ class SettingsDialog(QDialog):
             return
         pal = palette(self.theme.currentData())
         levels = pal["veil"]
+        floor = pal["veil_floor"]
         veil = veil_level(self.bg_veil.currentData())
+        # 与窗口里 `QFrame#panel` 用**同一个**数：预览条比真实窗口透，用户就会
+        # 照着预览挑一档、回到窗口发现不是那样。面板有保底，这里也要有。
+        percent = max(int(levels[veil]), int(floor["panel"]))
         overlay = QColor(pal["surface"])
-        overlay.setAlphaF(levels[veil] / 100.0)
+        overlay.setAlphaF(percent / 100.0)
         out = QPixmap(pixmap)
         painter = QPainter(out)
         painter.fillRect(out.rect(), overlay)
@@ -862,9 +867,7 @@ class SettingsDialog(QDialog):
         self._bg_preview.setText("")
         self._bg_preview.setPixmap(out)
         self._bg_preview.setToolTip(
-            "窗口里这块区域的样子：面板按「"
-            + str(levels[veil])
-            + "%」盖在图上。"
+            "窗口里这块区域的样子：面板按「" + str(percent) + "%」盖在图上。"
         )
 
     def _pick_background(self) -> None:
@@ -898,6 +901,9 @@ class SettingsDialog(QDialog):
         # 而漏掉的那个会一直可点、点了没反应。
         for widget in (self.bg_blur, self.bg_veil):
             widget.setEnabled(exists)
+        # 预览先刷新：下面那句「模糊开/关」要读渲染器的判定结果——图案太碎时
+        # 即使用户关掉了模糊，画出来仍然是糊的。文案与画面必须说同一件事。
+        self._refresh_bg_preview()
         if not text:
             self._bg_note.setText("留空则窗口使用默认底色。")
         elif not exists:
@@ -905,14 +911,17 @@ class SettingsDialog(QDialog):
                 "找不到这个文件，保存后窗口不会有背景（其余设置不受影响）。"
             )
         else:
+            if self._preview_renderer.auto_blur:
+                blur_text = "自动（图案较碎）" if not self.bg_blur.isChecked() else "开"
+            else:
+                blur_text = "开" if self.bg_blur.isChecked() else "关"
             self._bg_note.setText(
                 f"将使用：{Path(text).name}　"
-                f"（模糊{'开' if self.bg_blur.isChecked() else '关'}，"
+                f"（模糊{blur_text}，"
                 f"透出「{self.bg_veil.currentText().split('　')[0]}」）"
             )
-        # 预览条跟着一起更新：它是「图 + 模糊 + 蒙版」三者共同的产物，任何一项
-        # 变了都得重画——只更新文字说明的话，用户改完档位看到的还是上一档的图。
-        self._refresh_bg_preview()
+        # 预览条在函数开头已经重画过，这里不再重复调用——重画一次要重新缩放
+        # 整张图，拖动输入框时每个字符都会触发。
 
     def _sync_enabled(self) -> None:
         """非接口模式下，地址、密钥与兜底开关都不起作用，直接置灰。

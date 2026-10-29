@@ -75,9 +75,34 @@ from app.ui.theme import stylesheet  # noqa: E402
 from app.ui.widgets import EntryCard  # noqa: E402
 
 
+def _ink_contrast(image: QImage) -> tuple[str, float]:
+    """量一张控件截图：返回 (底色, 字与底的最大对比度)。
+
+    底色取右侧内边距上的一点（菜单项文字到不了那里），字色取**与底色反差最大**
+    的像素，而不是最暗或最亮像素：深色主题下最暗的那个像素就是底色自己，按
+    「最暗 vs 最亮」算会把一对同色同样深的东西算成高对比。
+    """
+
+    def _lin(v: int) -> float:
+        s = v / 255.0
+        return s / 12.92 if s <= 0.03928 else ((s + 0.055) / 1.055) ** 2.4
+
+    def _lum(name: str) -> float:
+        r, g, b = (int(name[i:i + 2], 16) for i in (1, 3, 5))
+        return 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
+
+    bg = image.pixelColor(image.width() - 3, image.height() // 2).name()
+    base = _lum(bg)
+    worst = 1.0
+    for y in range(image.height()):
+        for x in range(image.width()):
+            lum = _lum(image.pixelColor(x, y).name())
+            worst = max(worst, (max(lum, base) + 0.05) / (min(lum, base) + 0.05))
+    return bg, worst
+
+
 class DelayingProvider:
     """按词设定延迟的 Provider，用于制造「先发的请求后返回」的乱序竞态。"""
-
     name = "delaying"
 
     def __init__(self, delays: dict[str, float] | None = None) -> None:
@@ -411,25 +436,35 @@ EXPECT: dict = {
         and v[1] <= 8
         and abs(v[2] - 255) <= 8
     ),
-    # 清晰与模糊成对：只写一条的话，一个「永远模糊」或「永远不模糊」的实现
-    # 都能在单边上通过。
-    # 比值是主判据（≥3 倍），绝对值那一半是防「糊得不够」——实测清晰 187、
-    # 模糊 42，边缘过渡摊开到约 6 像素。
+    # 清晰与模糊成对：碎图两张都该是糊的，且「自动接管」为真——关着开关却
+    # 没有接管的话，用户看到的是一张清晰棋盘压在他的释义下面。
     "背景图模糊对比": (
         lambda v: isinstance(v, dict)
-        and v.get("清晰", 0) > v.get("模糊", 0) * 3
+        and v.get("自动接管") is True
+        and v.get("清晰", 999) < 60
         and v.get("模糊", 999) < 60
+        and abs(v.get("清晰", 0) - v.get("模糊", 99)) <= 3
     ),
     "清除背景后属性": False,
     "清除背景后窗口底色": (0xFB, 0xFB, 0xFA),
+    # 配置里给的是 blur=False，窗口读到的也必须是 False。硬编码成 True 时，
+    # 设置页那个勾选框就成了摆设，而画面上的差别会被自动模糊掩盖掉。
+    "模糊开关被读进窗口状态": False,
     # 档位必须真的接上样式：三档的 alpha 依次变小、都还留着一点透明度。
     # 只写「有个半透明的面」不够——档位没接上样式时（属性名写错、选择器少写
     # 一段），面板会**一直是同一个 alpha**，看起来一切正常，那个下拉框白做了。
     # 下限 100 是防「透到文字读不清」：alpha 100 时最坏底色只有 100。
+    # 档位必须真的接上样式，但不是三档各差一截：正文面板有保底，最透那档被
+    # 抬到与适中档同值。判据因此落在两件事上——最含蓄档仍要与适中档拉开距离
+    # （属性名写错、选择器少写一段时，三档会是一个 alpha，下拉框白做），且最透
+    # 档恰好等于保底值（写死 82 会拦住后续调值，所以跟调色板对表）。
+    # 单位要换算：面板 alpha 读出来是 0–255，保底表里存的是百分比。
     "各档位的面板不透明度": (
         lambda v: isinstance(v, dict)
         and set(v) == {"soft", "medium", "bold"}
-        and 255 > v["soft"] > v["medium"] > v["bold"] > 100
+        and 255 > v["soft"] > v["medium"] >= v["bold"] > 100
+        and v["bold"]
+        == round(theme_mod.palette("ink")["veil_floor"]["panel"] * 255 / 100)
     ),
     "背景蒙版档位属性": "medium",
     # 设置界面：档位顺序与默认档。顺序反了会让「明显」看起来最含蓄。
@@ -886,6 +921,8 @@ EXPECT: dict = {
     # 抽掉规则后像素仍是窗口底色），判据恒为真。它改由 selfcheck 盯模板。
     "详情区底色不随系统调色板变黑": True,
     "对话框底色不随系统调色板变黑": True,
+    "托盘菜单底色不随系统调色板变黑": True,
+    "托盘菜单文字在深色系统下仍读得清": True,
 }
 
 
@@ -2018,6 +2055,10 @@ def main() -> int:
         apply("", False)
         results["无背景时窗口底色"] = sample(8, 6)
         results["无背景时面板不透明"] = panel_alpha()
+        # 配置里的模糊开关必须真的被窗口读进去。画面上的证据被自动模糊盖住了
+        # （碎图关着开关也糊），所以这一条读状态——它拦的是「把开关硬编码成
+        # True/False」这类改动，那会让用户在设置里勾的东西彻底失效。
+        results["模糊开关被读进窗口状态"] = bool(window._bg_blur)
         # 档位取自配置的默认值——属性没设上时这里会是 None，而 None 在样式表里
         # 匹配不到任何一档，面板会退回完全不透明。
         results["背景蒙版档位属性"] = str(window.property("bgVeil"))
@@ -2027,12 +2068,20 @@ def main() -> int:
         results["背景图颜色"] = sample(8, 6)
         results["有背景时面板半透明"] = panel_alpha()
 
-        # ③ 棋盘 + 关模糊 → 硬边还在；开模糊 → 硬边被抹开。两条成对。
+        # ③ 棋盘 + 关模糊：图案太碎，模糊由渲染器自己接管，两张都该是糊的。
+        #    这条以前验的是「开关把硬边抹开」，现在开关的效力归 selfcheck 用
+        #    低结构图去验；这里要守的是另一半——**用户关着开关、画面不会突然
+        #    变成清晰的棋盘压在他的正文下面**。
         apply(str(checker_path), False)
         sharp = _strip_delta(window.grab().toImage(), 6, 20, 520)
+        auto = bool(window._background.auto_blur)
         apply(str(checker_path), True)
         blurred = _strip_delta(window.grab().toImage(), 6, 20, 520)
-        results["背景图模糊对比"] = {"清晰": sharp, "模糊": blurred}
+        results["背景图模糊对比"] = {
+            "清晰": sharp,
+            "模糊": blurred,
+            "自动接管": auto,
+        }
 
         # ④ 档位真的接上了样式：换一档，面板解析出来的 alpha 必须跟着变，且
         #    三档互不相同。只断言「有一个半透明的面」是不够的——档位若没接到
@@ -3366,6 +3415,13 @@ def main() -> int:
 
         面板与对话框这两条是**真的能失败**的（对话框是顶层窗口，自己会填背景；
         对应的变异 `对话框不留底色` 抓得住），所以留着。
+
+        **托盘右键菜单是第三个成员，第 31 轮补的。** 用户报的现象就是它：点托盘
+        图标弹出来的那两条（显示主窗口 / 退出）是黑字，几乎看不见。根因同样一条
+        ——字色被 `QWidget { color: $text; }` 接管成浅色主题的近黑色，底色没有
+        规则、取系统调色板的 `#1e1e1e`。实测对比度 1.01:1。
+        菜单在离屏平台上建不起来（托盘不可用），但菜单本身能建、能离屏渲染，
+        所以走 `_build_tray_menu()` 量它的字与底。
         """
         detail = window.detail
         panel = detail.parentWidget()
@@ -3390,12 +3446,27 @@ def main() -> int:
                 box.close()
                 box.deleteLater()
 
+        def menu_sample() -> tuple[str, float]:
+            """托盘右键菜单。走 `_build_tray_menu()`，与真机上右键看到的是同一份。"""
+            menu = window._build_tray_menu()
+            menu.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+            menu.show()
+            try:
+                QApplication.processEvents()
+                menu.resize(menu.sizeHint())
+                QApplication.processEvents()
+                return _ink_contrast(menu.grab().toImage())
+            finally:
+                menu.close()
+                menu.deleteLater()
+
         # 详情区切回占位态：内容居中，右下角必定是空白，采到的一定是底色，
         # 而不是某一行文字。
         detail.show_entry(None)
         QApplication.processEvents()
         light_panel = sample(panel)
         light_dialog = dialog_sample()
+        light_menu_bg, light_menu_ink = menu_sample()
 
         dark = QPalette()
         for role, name in (
@@ -3410,6 +3481,7 @@ def main() -> int:
         try:
             deep_panel = sample(panel)
             deep_dialog = dialog_sample()
+            deep_menu_bg, deep_menu_ink = menu_sample()
         finally:
             QApplication.setPalette(original)
             QApplication.processEvents()
@@ -3420,9 +3492,20 @@ def main() -> int:
         results["对话框底色不随系统调色板变黑"] = (
             deep_dialog == light_dialog and deep_dialog != "#1e1e1e"
         )
+        # 托盘菜单单独成一条：它的失效方式比上面两处更「安静」——底色和字色都
+        # 各自正常，只是**不是同一套**来源（底色系统给、字色主题给），合起来
+        # 是 1.01:1。所以只比底色够不够，会漏掉「字和底同色」这一种。
+        results["托盘菜单底色不随系统调色板变黑"] = (
+            deep_menu_bg == light_menu_bg and deep_menu_bg != "#1e1e1e"
+        )
+        results["托盘菜单文字在深色系统下仍读得清"] = (
+            min(light_menu_ink, deep_menu_ink) >= 4.5
+        )
         print(
             f"  INFO  底色：详情区 {light_panel}→{deep_panel}，"
-            f"对话框 {light_dialog}→{deep_dialog}",
+            f"对话框 {light_dialog}→{deep_dialog}，"
+            f"托盘菜单 {light_menu_bg}→{deep_menu_bg}"
+            f"（字/底对比 {light_menu_ink:.2f}→{deep_menu_ink:.2f}）",
             flush=True,
         )
 

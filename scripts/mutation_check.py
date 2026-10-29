@@ -813,7 +813,9 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         "    return max(8, min(48, round(size.height() / 70)))\n",
         "    return 0  # 变异：半径置零，apply_blur 会原样返回\n",
         "scripts/selfcheck.py",
-        "背景图：模糊开关真的改变画面",
+        # 期望换到「硬边被抹开」那条：碎图现在由自动模糊接管，开关本身不再
+        # 决定碎图糊不糊，所以原来那条「开关改变画面」已经观测不到半径。
+        "背景图：模糊真的把硬边抹开",
     ),
     (
         "background.py 坏图不再被挡住（拿一张解不开的图当背景）",
@@ -846,7 +848,26 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         '        self._bg_blur = bool(self.config.get("background_blur", True))\n',
         "        self._bg_blur = True\n",
         "scripts/gui_smoke.py",
-        "背景图模糊对比",
+        # 期望从像素换成状态：碎图由自动模糊接管后，「开关改变画面」这个观测
+        # 对碎图不再成立（关着也糊），只有读窗口记下的开关值才抓得住硬编码。
+        "模糊开关被读进窗口状态",
+    ),
+    (
+        "background.py 自动模糊被关掉（碎图直接压在正文下面）",
+        "app/ui/background.py",
+        "        blur = bool(blur) or self._auto_blur\n",
+        "        blur = bool(blur)\n",
+        "scripts/selfcheck.py",
+        "背景图：碎图关掉开关也走模糊",
+    ),
+    (
+        "background.py 自动模糊恒开（纯色与渐变也被糊，用户开关形同失效）",
+        "app/ui/background.py",
+        "    _mean, spread, edge = texture_stats(src)\n"
+        "    return edge > BUSY_EDGE or spread > BUSY_STD\n",
+        "    return True  # 变异：见谁都糊\n",
+        "scripts/selfcheck.py",
+        "背景图：纯色图不会被自动加模糊",
     ),
     (
         "main_window.py 换背景后不给子控件重算样式（面板一直是不透明的）",
@@ -869,9 +890,11 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
         "app/ui/theme.py",
         # 锚点带上末尾那一条（视图切换按钮）与收尾的括号：本轮往 targets 末尾
         # 插了 `QPushButton#mode`，`countLabel` 后面紧跟 `)` 的写法就不存在了。
-        '        ("QPushButton#mode", _rgb(pal["surface"])),\n    )\n',
-        '        ("QPushButton#mode", _rgb(pal["surface"])),\n'
-        '        ("QFrame#card", _rgb(pal["surface"])),\n'
+        # 再一轮之后每条目标多了一个「角色」字段，锚点跟着改成三元组写法——
+        # 变异对准的必须是**当前**的实现，对不准时残留检测器会在干净仓库上报警。
+        '        ("QPushButton#mode", "surface", ""),\n    )\n',
+        '        ("QPushButton#mode", "surface", ""),\n'
+        '        ("QFrame#card", "surface", "panel"),\n'
         "    )\n",
         "scripts/selfcheck.py",
         "卡片在背景图下保持不透明",
@@ -879,10 +902,18 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
     (
         "theme.py 规则里的不透明度另抄一份（改了档位表、规则不跟着变）",
         "app/ui/theme.py",
-        'f"{{ background: rgba({r}, {g}, {b}, {percent}%); }}"',
+        'f"{{ background: rgba({r}, {g}, {b}, {pct}%); }}"',
         'f"{{ background: rgba({r}, {g}, {b}, 88%); }}"',
         "scripts/selfcheck.py",
         "规则里的不透明度由档位表生成",
+    ),
+    (
+        "theme.py 正文面板不保底（最透那档把释义压回花纹里）",
+        "app/ui/theme.py",
+        "pct = max(percent, floors.get(role, 0)) if role else percent\n",
+        "pct = percent\n",
+        "scripts/selfcheck.py",
+        "正文面板与状态栏有保底",
     ),
     (
         "theme.py 档位顺序写反（越「明显」反而越不透）",
@@ -1109,7 +1140,7 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
     (
         "theme.py 裸按钮不再垫底（工具栏那三个按钮压在原图上读不清）",
         "app/ui/theme.py",
-        '        ("QPushButton#bare", _rgb(pal["surface"])),\n',
+        '        ("QPushButton#bare", "surface", ""),\n',
         "",
         "scripts/selfcheck.py",
         "面板之外直接压在原图上的文字也拿到了受控的表面",
@@ -1419,7 +1450,7 @@ MUTATIONS: list[tuple[str, str, str, str, str, str]] = [
     (
         "theme.py 把视图切换按钮移出半透明规则（配了背景图那三个字压在原图上）",
         "app/ui/theme.py",
-        '        ("QPushButton#mode", _rgb(pal["surface"])),\n',
+        '        ("QPushButton#mode", "surface", ""),\n',
         "",
         "scripts/selfcheck.py",
         "面板之外直接压在原图上的文字也拿到了受控的表面",

@@ -195,6 +195,9 @@ def _build_themes() -> dict[str, dict[str, object]]:
         base = dict(_BASE_DARK if tid in _DARK_THEMES else _BASE_LIGHT)
         base.update(_ACCENTS[tid])
         base["veil"] = dict(_VEIL_DARK if tid in _DARK_THEMES else _VEIL_LIGHT)
+        base["veil_floor"] = dict(
+            _VEIL_FLOOR_DARK if tid in _DARK_THEMES else _VEIL_FLOOR_LIGHT
+        )
         # 圆角与主题无关（六套共用一份），但必须**并进调色板**：`stylesheet()`
         # 的 `$name` 取值表就是调色板，而 `_TEMPLATE_KEYS` 那条「每套主题都补齐
         # 模板需要的全部键」的护栏也是拿它当名单的。放在外面另做一次替换，
@@ -216,6 +219,22 @@ def _build_themes() -> dict[str, dict[str, object]]:
 
 _VEIL_LIGHT = {"soft": 88, "medium": 72, "bold": 58}
 _VEIL_DARK = {"soft": 96, "medium": 84, "bold": 72}
+
+# 保底：**读字的地方不跟档位走**。
+#
+# 档位要调的是「边缘透出多少」，也就是窗口四周与工具栏这些不承载正文的地方。
+# 详情面板承载的是正文，把它一起调透的结果是：用户在滑块上挑了一个自己喜欢的
+# 观感，代价是释义读不出来——而他挑的时候看的是窗口边缘，不是正文。状态栏同样
+# 有字（「离线示例模式」那行），所以也按角色给了保底，只是不需要面板那么高。
+#
+# 最透那档原先给面板 58%，实测一张中间调的壁纸透上来以后，「同义语」的释义与
+# 「固定搭配」的译文直接糊在花纹里。保底值不动档位表本身：soft 仍是 88，只有
+# medium / bold 落到保底上，档位差在边缘照旧看得见。
+#
+# 键是**角色**而不是控件名：同一个角色今后可能挂多个选择器（比如卡片里的详情区
+# 将来也铺一层），写死控件名就得改两处。深浅分家的理由与档位值相同。
+_VEIL_FLOOR_LIGHT = {"panel": 82, "status": 88}
+_VEIL_FLOOR_DARK = {"panel": 86, "status": 90}
 
 # 档位名 → 浅色底座的不透明度。这是**默认主题**（浅色）下的档位表，供测试与界面
 # 直接引用；换主题时走 `palette(tid)["veil"]`。绑成字典而不是元组，是因为调用方
@@ -592,6 +611,28 @@ QToolTip {
     padding: 4px 7px;
 }
 
+/* 弹出菜单（托盘右键那两条：显示主窗口 / 退出）。
+   这是「深字压深底」的第三处实例，出现得最隐蔽：`QMenu` 是 `QWidget` 的子类，
+   上面那条 `QWidget { color: $text; }` 会把字色一起接管（浅色主题下是 #1F1F1E），
+   可菜单**没有背景规则**时底色取的是 `QPalette::Window`——系统的。系统开深色
+   模式，画面上就是 #1e1e1e 的底配 #1f1f1e 的字，对比度 1.01:1，等于隐形。
+   它比详情区和对话框那两处更晚才被发现，因为菜单只在点托盘图标那一瞬间出现，
+   截图脚本从来抓不到。
+   这里把底、字、选中态三样一起钉死，不再让任何一项落在系统调色板上。 */
+QMenu {
+    background: $surface;
+    color: $text;
+    border: 1px solid $border;
+    padding: 4px;
+}
+QMenu::item {
+    background: transparent;
+    padding: 6px 22px 6px 14px;
+    border-radius: $radius_control;
+}
+QMenu::item:selected { background: $accent_soft; color: $accent; }
+QMenu::separator { height: 1px; background: $border; margin: 4px 8px; }
+
 /* 有背景图时窗口让位，否则 QSS 铺的底色会把图片整个盖住。 */
 QMainWindow[hasBackground="true"] { background: transparent; }
 
@@ -689,29 +730,36 @@ _STRONG_TEXT: tuple[tuple[str, str], ...] = (
 
 
 def _veil_rules(pal: dict[str, object]) -> str:
-    """生成「面板按档位铺底色」与「最透档加深次要文字」的规则块。"""
+    """生成「面板按档位铺底色」与「最透档加深次要文字」的规则块。
+
+    每条目标带一个**角色**：`panel` / `status` 这两个角色另有保底值，档位压到
+    保底以下时按保底铺。角色写空串表示「这一处跟档位走」，没有保底。
+    """
     targets = (
-        ("QFrame#panel", _rgb(pal["surface"])),
-        ("QListWidget", _rgb(pal["track"])),
-        ("QStatusBar", _rgb(pal["bg"])),
-        ("QPushButton#bare", _rgb(pal["surface"])),
-        ("QLabel#countLabel", _rgb(pal["surface"])),
-        # 后两项是「选中态」的特殊底：`#mode` 未选中时垫面板色，选中时垫**强调色
+        ("QFrame#panel", "surface", "panel"),
+        ("QListWidget", "track", ""),
+        ("QStatusBar", "bg", "status"),
+        ("QPushButton#bare", "surface", ""),
+        ("QLabel#countLabel", "surface", ""),
+        # 后三项是「选中态」的特殊底：`#mode` 未选中时垫面板色，选中时垫**强调色
         # 的浅底**——否则最透那一档会把选中态的半透明底统一刷成面板色，选中与
         # 未选中又变得一模一样（这正是加 `:checked` 之前的状态）。
         # 顺序有讲究：`("QPushButton#mode", ...)` 必须**留在最后一条**，
         # 变异脚本有一条锚点就是拿「它 + 收尾括号」定位的。
-        ("QPushButton#review", _rgb(pal["surface"])),
-        ("QPushButton#refresh", _rgb(pal["surface"])),
-        ("QPushButton#mode:checked", _rgb(pal["accent_soft"])),
-        ("QPushButton#mode", _rgb(pal["surface"])),
+        ("QPushButton#review", "surface", ""),
+        ("QPushButton#refresh", "surface", ""),
+        ("QPushButton#mode:checked", "accent_soft", ""),
+        ("QPushButton#mode", "surface", ""),
     )
+    floors = pal.get("veil_floor") or {}
     lines: list[str] = []
     for level, percent in pal["veil"].items():  # type: ignore[union-attr]
-        for target, (r, g, b) in targets:
+        for target, color_key, role in targets:
+            r, g, b = _rgb(pal[color_key])  # type: ignore[arg-type]
+            pct = max(percent, floors.get(role, 0)) if role else percent
             lines.append(
                 f'QMainWindow[hasBackground="true"][bgVeil="{level}"] {target} '
-                f"{{ background: rgba({r}, {g}, {b}, {percent}%); }}"
+                f"{{ background: rgba({r}, {g}, {b}, {pct}%); }}"
             )
     # 最「明显」那一档：直接压在面板上的次要文字换成加深一档的颜色，否则会跟
     # 透上来的背景融在一起。soft / medium 原样不动——动它们只会无端把

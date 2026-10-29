@@ -39,6 +39,71 @@ WORK_SIZE = QSize(1600, 1000)
 # 卷积变成秒级操作，而它在屏幕上不可能比窗口更清楚。
 MAX_SOURCE_EDGE = 8000
 
+# ---------------------------------------------------------------------------
+# 图案太碎就自动模糊
+#
+# 「加模糊蒙版」是用户开关，但关掉之后照片的细节会直接压在正文下面：面板再
+# 不透明，透上来的那一层也是花纹。实测一张打印稿截图做背景，关掉模糊后在 88%
+# 的面板上仍能读出原文的笔画，正文就被搅成一团。
+#
+# 判据取三个数，都在 64×64 灰度缩略图上算（一次几毫秒，只在加载时跑）：
+#   - 相邻像素平均差：花纹有多碎。一张渐变壁纸在 2 上下，照片在 20 以上。
+#   - 亮度标准差：整体明暗有多散。
+#   - 平均亮度：只作诊断，**不进判定**。模糊改不了平均亮度——一张纯白图糊完
+#     还是白的，拿它去治「图太亮」只是白费一次卷积。亮度那一半由面板保底负责
+#     （见 `theme._VEIL_FLOOR_*`）。
+# 判据要能在**原图**上算，不能算模糊之后的结果——模糊是它要决定的事。
+# ---------------------------------------------------------------------------
+STATS_SIZE = QSize(64, 64)
+BUSY_EDGE = 12.0
+BUSY_STD = 34.0
+
+
+def texture_stats(src: QPixmap) -> tuple[float, float, float]:
+    """返回 `(平均亮度, 亮度标准差, 相邻像素平均差)`，取值都在 0–255。
+
+    源图为空时返回 `(0, 0, 0)`。三个数都在灰度缩略图上算，不看原分辨率。
+    """
+    if src.isNull():
+        return (0.0, 0.0, 0.0)
+    small = scale_cover(src, STATS_SIZE)
+    if small.isNull():
+        return (0.0, 0.0, 0.0)
+    image = small.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
+    width, height, stride = image.width(), image.height(), image.bytesPerLine()
+    # 走 `constBits` 而不是逐点 `pixelColor`：后者每个像素一次 C++ 边界调用，
+    # 4096 个点要几十毫秒。这里一次性拿走连续内存，pad 字节用 stride 跳掉。
+    data = bytes(image.constBits())
+    values = [
+        value
+        for y in range(height)
+        for value in data[y * stride : y * stride + width]
+    ]
+    count = len(values) or 1
+    mean = sum(values) / count
+    variance = sum((value - mean) ** 2 for value in values) / count
+    edge_total = 0.0
+    edge_count = 0
+    for y in range(height):
+        row = data[y * stride : y * stride + width]
+        for x in range(width - 1):
+            edge_total += abs(row[x] - row[x + 1])
+            edge_count += 1
+    return (mean, variance**0.5, edge_total / (edge_count or 1))
+
+
+def needs_auto_blur(src: QPixmap) -> bool:
+    """图案太碎时返回 `True`。
+
+    这一条**只往上加不往下减**：用户勾了模糊，结果就是模糊；用户没勾，这里
+    仍然可能替他勾上。反过来（替他关掉）没有理由——模糊从不会让字更难读。
+
+    只看结构，不看明暗，理由见上面的注释：模糊能抹平花纹，抹不平亮度。纯色图
+    （无论黑白）在这里是 `False`，因为把一张纯色图糊一遍，屏幕上不会有任何变化。
+    """
+    _mean, spread, edge = texture_stats(src)
+    return edge > BUSY_EDGE or spread > BUSY_STD
+
 
 def scale_cover(src: QPixmap, size: QSize) -> QPixmap:
     """等比放大到**恰好覆盖** `size`，多出来的部分从中心对称裁掉。
@@ -134,6 +199,7 @@ class BackgroundRenderer:
         self._blurred: QPixmap | None = None
         self._cache_key: tuple[int, int, bool] | None = None
         self._cache: QPixmap | None = None
+        self._auto_blur = False
 
     @property
     def source_path(self) -> str:
@@ -142,6 +208,15 @@ class BackgroundRenderer:
     @property
     def has_image(self) -> bool:
         return self._source is not None
+
+    @property
+    def auto_blur(self) -> bool:
+        """当前这张图是不是因为「太碎」被自动加了模糊。
+
+        `pixmap_for(..., blur=False)` 仍可能输出模糊图——调用方要把这件事告诉
+        用户，否则开关明明关着、画面却在糊，看起来像开关坏了。
+        """
+        return self._auto_blur
 
     def set_source(self, path: object) -> bool:
         """设置背景图。返回是否真的拿到了一张可用的图。
@@ -155,6 +230,7 @@ class BackgroundRenderer:
         self._blurred = None
         self._cache_key = None
         self._cache = None
+        self._auto_blur = False
         if not text:
             return False
         try:
@@ -174,15 +250,21 @@ class BackgroundRenderer:
                 Qt.TransformationMode.SmoothTransformation,
             )
         self._source = pixmap
+        self._auto_blur = needs_auto_blur(pixmap)
         return True
 
     def clear(self) -> None:
         self.set_source("")
 
     def pixmap_for(self, size: QSize, blur: bool) -> QPixmap | None:
-        """取出恰好 `size` 大小的背景图；没有图或尺寸非法时返回 `None`。"""
+        """取出恰好 `size` 大小的背景图；没有图或尺寸非法时返回 `None`。
+
+        `blur` 传的是**用户开关**的意愿，不是最终结论：图案太碎时这里会自己
+        补上模糊（见 `needs_auto_blur`），`auto_blur` 属性说明有没有补过。
+        """
         if self._source is None or size.width() <= 0 or size.height() <= 0:
             return None
+        blur = bool(blur) or self._auto_blur
         key = (size.width(), size.height(), bool(blur))
         if key == self._cache_key and self._cache is not None:
             return self._cache

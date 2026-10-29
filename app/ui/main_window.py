@@ -356,12 +356,7 @@ class MainWindow(QMainWindow):
         tray = QSystemTrayIcon(app.windowIcon(), self)
         tray.setToolTip(f"Quill · 英语生词本（{HOTKEY_TEXT} 唤出）")
 
-        menu = QMenu(self)
-        act_show = menu.addAction("显示主窗口")
-        act_show.triggered.connect(self._restore_from_tray)
-        menu.addSeparator()
-        act_quit = menu.addAction("退出")
-        act_quit.triggered.connect(self._quit_from_tray)
+        menu = self._build_tray_menu()
         tray.setContextMenu(menu)
         tray.activated.connect(self._on_tray_activated)
         tray.show()
@@ -382,6 +377,23 @@ class MainWindow(QMainWindow):
                 f"关掉占用它的程序后重启本程序即可恢复",
                 10000,
             )
+
+    def _build_tray_menu(self) -> QMenu:
+        """托盘右键菜单：显示主窗口 / 退出。
+
+        单独成方法不是为了复用，是为了**让界面测试摸得着**：菜单只在点托盘
+        图标那一瞬间出现在系统托盘区，截图脚本抓不到；而托盘本身在离屏平台上
+        建不起来（`isSystemTrayAvailable()` 为假），整条路径测不到。
+        抽出这一层之后，测试直接用同一份代码建菜单、离屏渲染、量对比度——
+        量的是真实链路，不是照着样式表另抄一份。
+        """
+        menu = QMenu(self)
+        act_show = menu.addAction("显示主窗口")
+        act_show.triggered.connect(self._restore_from_tray)
+        menu.addSeparator()
+        act_quit = menu.addAction("退出")
+        act_quit.triggered.connect(self._quit_from_tray)
+        return menu
 
     def _teardown_tray(self) -> None:
         """撤掉托盘与热键。重复调用安全。"""
@@ -3036,6 +3048,11 @@ class MainWindow(QMainWindow):
         if str(self.config.get("background_image") or "").strip() and not loaded:
             self.statusBar().showMessage(
                 "设置已保存，但背景图没能加载（路径或文件格式有问题），已忽略背景"
+            )
+        elif self._background.auto_blur and not self.config.get("background_blur", True):
+            # 开关关着、画面却糊了，不说一句就成了「开关坏了」。只说事实。
+            self.statusBar().showMessage(
+                "设置已保存；这张图图案较碎，已自动加模糊，免得挡住正文"
             )
         else:
             self.statusBar().showMessage("设置已保存")

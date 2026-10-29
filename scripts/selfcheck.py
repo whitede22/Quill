@@ -72,7 +72,13 @@ from app.core.lemmatizer import candidates as lemma_candidates  # noqa: E402
 from app import theme_meta as theme_meta_mod  # noqa: E402
 from app.ui import theme as theme_mod  # noqa: E402
 from app.ui import background as background_mod  # noqa: E402
-from app.ui.background import BackgroundRenderer, apply_blur, scale_cover  # noqa: E402
+from app.ui.background import (  # noqa: E402
+    BackgroundRenderer,
+    apply_blur,
+    needs_auto_blur,
+    scale_cover,
+    texture_stats,
+)
 from app.ui import onboarding as ob_mod  # noqa: E402
 from app.core.models import Entry, Phrase, Synonym, join_tags, split_tags  # noqa: E402
 from app.core.repository import Repository, build_fts_query  # noqa: E402
@@ -89,7 +95,7 @@ from app.security.keystore import decrypt_text, encrypt_text  # noqa: E402
 # PDF 读回校验用：QtPdf 负责解析产物，QSize/QImage 用于渲染。
 # 直接用 Qt 而不引入新依赖——它们是 PySide6 自带的。
 from PySide6.QtCore import QSize, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap  # noqa: E402
+from PySide6.QtGui import QBrush, QColor, QImage, QLinearGradient, QPainter, QPixmap  # noqa: E402
 from PySide6.QtPdf import QPdfDocument  # noqa: E402
 
 
@@ -4487,6 +4493,73 @@ def main() -> int:
         f"边角最大偏差 {_edge_worst}",
     )
 
+    # ③ 自动模糊：图案碎的图要补模糊，纯色与低结构渐变不该被补。
+    #    成对写——只验「碎的被补」的话，一个 `return True` 的实现也能通过；
+    #    只验「纯色不被补」的话，一个 `return False` 同样能过。
+    _flat_pix = QPixmap.fromImage(_flat)
+    _flat_mean, _flat_std, _flat_edge = texture_stats(_flat_pix)
+    check(
+        "背景图：纯色图的结构强度为 0（下面两条的前提）",
+        _flat_std == 0 and _flat_edge == 0,
+        f"std={_flat_std:.2f} edge={_flat_edge:.2f}",
+    )
+    check(
+        "背景图：纯色图不会被自动加模糊（糊一遍屏幕上不会有任何变化）",
+        not needs_auto_blur(_flat_pix),
+        f"mean={_flat_mean:.1f} std={_flat_std:.2f} edge={_flat_edge:.2f}",
+    )
+    # 渐变：有明暗跨度但没有花纹。它不该被补——判据要是漏了「看结构」这一层，
+    # 只看亮度跨度的话，一张从白到灰的渐变会被误判成「花」。
+    _ramp = QImage(256, 64, QImage.Format.Format_RGB32)
+    _ramp_painter = QPainter(_ramp)
+    _ramp_grad = QLinearGradient(0, 0, 256, 0)
+    _ramp_grad.setColorAt(0.0, QColor(250, 250, 250))
+    _ramp_grad.setColorAt(1.0, QColor(120, 120, 120))
+    _ramp_painter.fillRect(0, 0, 256, 64, QBrush(_ramp_grad))
+    _ramp_painter.end()
+    _ramp_pix = QPixmap.fromImage(_ramp)
+    _ramp_path = _bg_dir / "ramp.png"
+    check("背景图：渐变测试图可写出", _ramp.save(str(_ramp_path)))
+    _ramp_mean, _ramp_std, _ramp_edge = texture_stats(_ramp_pix)
+    check(
+        "背景图：渐变图不会被自动加模糊（有明暗跨度，但没有花纹）",
+        not needs_auto_blur(_ramp_pix),
+        f"mean={_ramp_mean:.1f} std={_ramp_std:.2f} edge={_ramp_edge:.2f}",
+    )
+    _checker_pix = QPixmap.fromImage(_checker)
+    _chk_mean, _chk_std, _chk_edge = texture_stats(_checker_pix)
+    check(
+        "背景图：花纹重的图会被自动加模糊",
+        needs_auto_blur(_checker_pix),
+        f"mean={_chk_mean:.1f} std={_chk_std:.2f} edge={_chk_edge:.2f}",
+    )
+    # 判据要真的接到出图上：标记为「已自动模糊」之后，即便调用方传 `blur=False`，
+    # 拿到的也必须是糊的那张。只验 `set_source` 里那个布尔，等于没验到用户看到的
+    # 那一层——开关关着、画面还在糊，正是这次要拦的事。
+    _auto = BackgroundRenderer()
+    check(
+        "背景图：碎图加载后标记为「已自动模糊」",
+        _auto.set_source(_checker_path) and _auto.auto_blur,
+        f"auto_blur={_auto.auto_blur}",
+    )
+    _auto_out = _auto.pixmap_for(QSize(300, 300), False)
+    _auto_delta = _max_h_delta(_auto_out.toImage()) if _auto_out is not None else -1
+    check(
+        "背景图：关掉模糊开关后，碎图出来的仍然是模糊的那张",
+        _auto_out is not None and _auto_delta < _sharp_delta * 0.5,
+        f"输出最大相邻差 {_auto_delta}（清晰 {_sharp_delta}）",
+    )
+    _plain = BackgroundRenderer()
+    _plain.set_source(_solid_path)
+    _plain_out = _plain.pixmap_for(QSize(300, 300), False)
+    check(
+        "背景图：纯色图关掉模糊后保持标记为否（不撒谎，界面文案才不会自相矛盾）",
+        not _plain.auto_blur
+        and _plain_out is not None
+        and _plain_out.toImage().pixelColor(150, 150).name() == "#ff00ff",
+        f"auto_blur={_plain.auto_blur}",
+    )
+
     # ③ 「没有背景」的三种来源都必须安静地失败。任何一条抛异常都会让窗口
     #    在启动时就崩——而用户只是把图片挪了个位置。
     _renderer = BackgroundRenderer()
@@ -4550,16 +4623,40 @@ def main() -> int:
     )
 
     _toggled = BackgroundRenderer()
-    _toggled.set_source(str(_checker_path))
-    # 取 600x600 而不是缩略图尺寸：模糊是在固定的工作尺寸上做的，再缩到很小的
-    # 画面上会把模糊一起缩没，两种形态的差别随之变得难以判定——那是**测试选错
-    # 了观察尺度**，不是功能有问题。
-    _off = _toggled.pixmap_for(QSize(600, 600), False).toImage()
-    _on = _toggled.pixmap_for(QSize(600, 600), True).toImage()
+    # 开关的效力分两半，两半都要验：碎图由自动模糊接管（开关关着也糊），
+    # 不碎的图才由用户说了算。只验一半的话，另一半可以静默坏掉——而坏掉的那一半
+    # 恰好是用户唯一还能控制的那半。
+    _blur_calls.clear()
+    background_mod.apply_blur = lambda pm, r: (  # type: ignore[assignment]
+        _blur_calls.append(r),
+        _real_blur(pm, r),
+    )[1]
+    try:
+        _toggled = BackgroundRenderer()
+        _toggled.set_source(str(_checker_path))
+        # 取 600x600 而不是缩略图尺寸：模糊是在固定的工作尺寸上做的，再缩到很小的
+        # 画面上会把模糊一起缩没，两种形态的差别随之变得难以判定——那是**测试选错
+        # 了观察尺度**，不是功能有问题。
+        _off = _toggled.pixmap_for(QSize(600, 600), False).toImage()
+        _on = _toggled.pixmap_for(QSize(600, 600), True).toImage()
+        _busy_calls = len(_blur_calls)
+        _gentle = BackgroundRenderer()
+        _gentle.set_source(str(_ramp_path))
+        _gentle_off = _gentle.pixmap_for(QSize(600, 600), False)
+        _gentle_off_calls = len(_blur_calls) - _busy_calls
+        _gentle.pixmap_for(QSize(600, 600), True)
+        _gentle_on_calls = len(_blur_calls) - _busy_calls - _gentle_off_calls
+    finally:
+        background_mod.apply_blur = _real_blur  # type: ignore[assignment]
     check(
-        "背景图：模糊开关真的改变画面（勾了不是白勾）",
-        _max_h_delta(_off) > _max_h_delta(_on) * 2,
-        f"关 {_max_h_delta(_off)} → 开 {_max_h_delta(_on)}",
+        "背景图：碎图关掉开关也走模糊（自动接管，否则照片细节直接压在正文上）",
+        _busy_calls >= 1 and abs(_max_h_delta(_off) - _max_h_delta(_on)) <= 2,
+        f"关 {_max_h_delta(_off)} / 开 {_max_h_delta(_on)}，模糊跑了 {_busy_calls} 次",
+    )
+    check(
+        "背景图：不高碎度的图仍由开关决定（关着不算模糊，勾了才算）",
+        _gentle_off is not None and _gentle_off_calls == 0 and _gentle_on_calls == 1,
+        f"关 {_gentle_off_calls} 次 / 开 {_gentle_on_calls} 次",
     )
 
     # ⑤ 样式侧：窗口与状态栏都得给图片让位。不让位的话图片会被 QSS 铺的底色
@@ -4684,6 +4781,62 @@ def main() -> int:
         not _veil_missing,
         str(_veil_missing),
     )
+    # 保底：正文面板与状态栏**不跟着档位一起变透**。
+    #
+    # 这条不能写成「规则里有 82」——写死数字的话，档位表一调它就变成假声明，
+    # 而且是那种「改了配置、测试还绿」的假。所以两处都从配置算：期望值 = 档位
+    # 与保底取大，再拿去比实际生成出来的百分比。
+    #
+    # 同时钉住「保底只抬最透的档」：`QPushButton#bare` 这类没有角色的目标必须
+    # 仍等于档位值。少了这一条，把保底写进循环外面（所有目标一起抬）也能通过。
+    _role_of = {"QFrame#panel": "panel", "QStatusBar": "status"}
+    _target_pat = re.compile(
+        r'bgVeil="([^"]+)"\] (QFrame#panel|QStatusBar|QPushButton#bare) '
+        r"\{ background: rgba\((\d+), (\d+), (\d+), (\d+)%\); \}"
+    )
+    _floor_bad: list[str] = []
+    # 调色板现场取，不借后面那段 `_palettes`：它在本段之后才定义，借了就是
+    # 「变量还没赋值」（UnboundLocalError），而这行错误会把后面几百条断言一起
+    # 带走，看着像「全绿」实为「没跑」。
+    for _fid in theme_mod.theme_ids():
+        _fpal = theme_mod.palette(_fid)
+        _lv = _fpal["veil"]
+        _floor = _fpal["veil_floor"]
+        _rows = _target_pat.findall(theme_mod.stylesheet(_fid))
+        _seen = {(level, sel) for level, sel, *_rest in _rows}
+        for _level in _lv:
+            for _sel in ("QFrame#panel", "QStatusBar", "QPushButton#bare"):
+                if (_level, _sel) not in _seen:
+                    _floor_bad.append(f"{_fid}/{_level}/{_sel} 没生成规则")
+        for _level, _sel, _r, _g, _b, _pct in _rows:
+            _role = _role_of.get(_sel)
+            _want = max(_lv[_level], _floor[_role]) if _role else _lv[_level]
+            if int(_pct) != _want:
+                _floor_bad.append(f"{_fid}/{_level}/{_sel} {_pct}% 应为 {_want}%")
+        _softest = max(_lv, key=lambda name: _lv[name])
+        for _role, _value in _floor.items():
+            if _value > _lv[_softest]:
+                _floor_bad.append(f"{_fid}/{_role} 保底 {_value} 高过最含蓄档")
+    check(
+        "正文面板与状态栏有保底：最透的两档抬到保底，最含蓄那档与其它控件不动",
+        not _floor_bad,
+        str(_floor_bad[:6]),
+    )
+    # 保底值本身要够高。这条与上面那条是两件事：上面验「规则被正确地生成了」，
+    # 这里验「这个数值得够读」——把保底从 82 改成 60，上面照样绿。
+    _floor_contrast_bad = []
+    for _fid in theme_mod.theme_ids():
+        _fpal = theme_mod.palette(_fid)
+        _under = 0 if not _fpal["dark"] else 255
+        _pct = _fpal["veil_floor"]["panel"]
+        _c = _contrast(_fpal["text"], _blend(_fpal["surface"], _under, _pct))
+        if _c < 4.5:
+            _floor_contrast_bad.append(f"{_fid} 保底 {_pct}% 正文={_c:.2f}")
+    check(
+        "保底值在最坏背景上仍守住正文对比度（4.5:1）",
+        not _floor_contrast_bad,
+        str(_floor_contrast_bad),
+    )
     # 面板之外还有两处「自己没有表面」的文字：工具栏那三个无边框按钮与左栏的
     # 计数标签。它们直接压在**原图**上，而图片的明暗未知——浅色主题的次要文字
     # `#8A8A86` 压在一张中间调的图上，对比度趋近 1:1，不是"偏淡"是看不见；
@@ -4719,12 +4872,20 @@ def main() -> int:
     # 那条判据恒为真，已删除；效果本身只在真实桌面 + 系统深色下可见，这里不假装
     # 证过它，只钉住**这条规则没有被删**——那是程序员忘了搬走它时唯一会出问题的地方。
     check(
-        "容器底色来自主题而非系统调色板（详情区滚动容器 / 对话框 / 分裂条手柄）",
+        "容器底色来自主题而非系统调色板（详情区滚动容器 / 对话框 / 分裂条手柄 / 托盘菜单）",
         "QScrollArea { background: transparent; border: none; }"
         in theme_mod._QSS.template
         and "QDialog { background: $bg; }" in theme_mod._QSS.template
         and re.search(
             r"QSplitter::handle\s*\{[^}]*background\s*:\s*transparent",
+            _qss_code_only(theme_mod._QSS.template),
+        )
+        is not None
+        # 托盘菜单：底与字必须成对出现在同一条规则里。只补底色不补字色，字仍
+        # 走 `QWidget { color: $text; }`；只补字色不补底，底仍取系统调色板——
+        # 两种半吊子都会回到「看不清」，而且哪一种都不报错。
+        and re.search(
+            r"QMenu\s*\{[^}]*background\s*:\s*\$surface[^}]*color\s*:\s*\$text",
             _qss_code_only(theme_mod._QSS.template),
         )
         is not None,
