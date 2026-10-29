@@ -163,153 +163,9 @@ class EntryDetail(QWidget):
         try:
             inner.addLayout(self._build_head(entry))
             inner.addWidget(_divider())
-
-            # 缺项提示紧跟在标题下方：空字段是「不渲染」的，不说出来，
-            # 用户就会把「接口没给同义语」当成「这个词没有同义语」。
-            self._warn_label = None
-            self._stale_label = None
-            self._fallback_label = None
-
-            # 兜底提示排在缺项之前——它说的是更靠前的一件事：「你选的接口这次
-            # 没通」。不说的话，用户看到释义就以为接口是通的，直到发现同义语
-            # 一直是空的、例句越来越少，才回头怀疑配置。
-            reason = (getattr(entry, "fallback_reason", "") or "").strip()
-            if reason:
-                fallback = QLabel(f"接口请求失败，以下内容来自本机离线词库　{reason}")
-                fallback.setObjectName("warn")
-                fallback.setWordWrap(True)
-                inner.addWidget(fallback)
-                self._fallback_label = fallback
-
-            # 只把该来源「结构上能给」的要素算作缺项。离线词库不含同义语，
-            # 若照喊，每条离线词条底下都会挂一句「缺少同义语」——
-            # 提示恒定出现就等于没有提示，真正的缺项反而被淹没。
-            missing = entry.missing_parts(provided_fields(entry.source))
-            if missing:
-                # 判据是**当前是否联网**（`self._networked`），不是词条的来源。
-                #
-                # 曾经这里写的是 `entry.source == "offline"`，而兜底产出的词条
-                # 来源**也是** "offline"——于是用户在接口模式下遇到接口失败、
-                # 拿到一条兜底内容时，看到的出路是「可在设置中切到接口模式」，
-                # 而他本来就在接口模式里。那句话让他去开一个已经开着的开关。
-                #
-                # 「来源是离线」与「用户选了离线」是两件事：前者说明这条内容
-                # 从哪来，后者才决定出路该怎么给。`set_networked` 的说明早就
-                # 写对了这件事，只是渲染时没用它。
-                if self._networked:
-                    text = (
-                        f"此词条不完整，缺少：{'、'.join(missing)}　可点下方「重新查询」"
-                    )
-                else:
-                    # 离线模式：重查还是同一本词典，让用户白点一次不如直说怎么补
-                    text = (
-                        f"此词条不完整，缺少：{'、'.join(missing)}　"
-                        "离线词库只为常用词配例句，需要补全可在设置中切到接口模式"
-                    )
-                warn = QLabel(text)
-                warn.setObjectName("warn")
-                warn.setWordWrap(True)
-                inner.addWidget(warn)
-                self._warn_label = warn
-
-            # 提示词版本落后的提示。与「不完整」分开说，因为两者性质不同：
-            # 缺项是接口这次没给全，版本落后是这条内容本身按旧标准生成。
-            # 只提示、不自动重查——自动重查会在离线时把「内容可能是旧的」
-            # 变成「连旧的都看不到了」。
-            if getattr(entry, "prompt_stale", False):
-                # 版本 0 表示来源不明（正常写入路径不会产生），写成「v0」会让用户
-                # 以为存在过一个叫 v0 的提示词。宁可说清楚是「未知」。
-                was = (
-                    f"v{int(entry.prompt_version)}"
-                    if int(entry.prompt_version or 0) > 0
-                    else "来源未知"
-                )
-                stale = QLabel(
-                    f"此词条由旧版提示词生成（{was} → v{PROMPT_VERSION}），"
-                    "内容可能未按当前标准　可点下方「重新查询」更新"
-                )
-                stale.setObjectName("warn")
-                stale.setWordWrap(True)
-                inner.addWidget(stale)
-                self._stale_label = stale
-
-            self._add_section(inner, "英", entry.definition_en)
-            self._add_section(inner, "中", entry.definition_zh)
-
-            if entry.synonyms:
-                inner.addSpacing(4)
-                inner.addWidget(_section_title(f"同义语　{len(entry.synonyms)} 个"))
-                # 先把整批行建好再统一 chip 宽度，之后才挂进布局：
-                # 等宽是「这批词」的属性，一行一行建就只能各自为政。
-                synonym_rows = [
-                    self._build_synonym_row(syn) for syn in entry.synonyms
-                ]
-                self._equalize_chips(synonym_rows)
-                for row in synonym_rows:
-                    inner.addLayout(row)
-
-            # 固定搭配。位置排在例句**之前**：例句说的是「这个词」，搭配说的是
-            # 「这个词怎么用」，后者才是查词时真正要解决的事。
-            #
-            # 整块不渲染的条件只是「没有搭配」，**不按来源分叉**：离线词库结构上
-            # 就没有这一块，那种情况由上面的缺项提示如实说出来（缺项名单里含
-            # 「固定搭配」），而不是在这里再判一次来源——两处判同一件事，
-            # 迟早会有一处忘了改。
-            if entry.collocations:
-                inner.addSpacing(4)
-                inner.addWidget(
-                    _section_title(f"固定搭配　{len(entry.collocations)} 条")
-                )
-                for coll in entry.collocations:
-                    inner.addWidget(self._build_collocation_block(entry, coll))
-
-            # 已经收藏过的、含这个词的词组。纯本地查询，用来回答「这个词我到底
-            # 攒过哪些搭配」——它和上面那批是两回事：上面是接口刚给的，这里是
-            # 用户自己收的。
-            if collected:
-                inner.addSpacing(4)
-                inner.addWidget(_section_title("已收藏的含本词的词组"))
-                label = QLabel("、".join(collected))
-                label.setObjectName("muted")
-                label.setWordWrap(True)
-                inner.addWidget(label)
-                self._collected_label = label
-
-            if entry.example:
-                inner.addSpacing(4)
-                inner.addWidget(_section_title("例句"))
-                example = QLabel(entry.example)
-                example.setObjectName("body")
-                example.setWordWrap(True)
-                inner.addWidget(example)
-                if entry.example_zh:
-                    example_zh = QLabel(entry.example_zh)
-                    example_zh.setObjectName("muted")
-                    example_zh.setWordWrap(True)
-                    inner.addWidget(example_zh)
-
-            inner.addSpacing(6)
-            inner.addWidget(_section_title("备注"))
-            self._note_edit = QPlainTextEdit()
-            self._note_edit.setPlainText(entry.notes or "")
-            self._note_edit.setPlaceholderText("为这个词写点什么…（自动保存）")
-            self._note_edit.setFixedHeight(66)
-            self._note_edit.textChanged.connect(self._on_note_changed)
-            inner.addWidget(self._note_edit)
-
-            # 标签。**这一行就是 `tags` 字段的全部入口**——在此之前它贯通了模型、
-            # 数据库、FTS（权重 3.0，与备注同级）与导出，但界面上没有任何地方能
-            # 编辑它，于是那一档权重永远挂在一个恒为空的列上。
-            #
-            # 值与用户输入之间必须过一道 `join_tags`：写进库里的形态只能是单空格
-            # 分隔，否则按标签筛选就退化成子串匹配（筛「考研」带出「考研英语」）。
-            inner.addSpacing(4)
-            inner.addWidget(_section_title("标签"))
-            self._tag_edit = QLineEdit(join_tags(entry.tags))
-            self._tag_edit.setPlaceholderText("用空格或逗号分隔，例如：考研 高频（自动保存）")
-            self._tag_edit.setToolTip("给这个词分类；左栏可以按标签筛选。")
-            self._tag_edit.textChanged.connect(self._on_tags_changed)
-            inner.addWidget(self._tag_edit)
+            self._add_hints(inner, entry)
+            self._add_body(inner, entry, collected)
+            self._add_user_fields(inner, entry)
 
             if entry.aliases:
                 inner.addSpacing(2)
@@ -324,6 +180,173 @@ class EntryDetail(QWidget):
             inner.addStretch(1)
         finally:
             self._loading = False
+
+    def _add_hints(self, inner: QVBoxLayout, entry: Entry) -> None:
+        """标题下方的三种提示，按「更靠前的原因」从上到下排。
+
+        三者都可能不出现，所以引用一律先置空：上一轮渲染留下的控件指针
+        已经随 `_reset()` 销毁，留着不置空就是悬空引用。
+        """
+        self._warn_label = None
+        self._stale_label = None
+        self._fallback_label = None
+
+        self._add_fallback_hint(inner, entry)
+        self._add_missing_hint(inner, entry)
+        self._add_stale_hint(inner, entry)
+
+    def _add_fallback_hint(self, inner: QVBoxLayout, entry: Entry) -> None:
+        """兜底提示排在缺项之前——它说的是更靠前的一件事：「你选的接口这次没通」。
+
+        不说的话，用户看到释义就以为接口是通的，直到发现同义语一直是空的、
+        例句越来越少，才回头怀疑配置。
+        """
+        reason = (getattr(entry, "fallback_reason", "") or "").strip()
+        if not reason:
+            return
+        fallback = QLabel(f"接口请求失败，以下内容来自本机离线词库　{reason}")
+        fallback.setObjectName("warn")
+        fallback.setWordWrap(True)
+        inner.addWidget(fallback)
+        self._fallback_label = fallback
+
+    def _add_missing_hint(self, inner: QVBoxLayout, entry: Entry) -> None:
+        """缺项提示。只把该来源「结构上能给」的要素算作缺项。
+
+        离线词库不含同义语，若照喊，每条离线词条底下都会挂一句「缺少同义语」——
+        提示恒定出现就等于没有提示，真正的缺项反而被淹没。
+        """
+        missing = entry.missing_parts(provided_fields(entry.source))
+        if not missing:
+            return
+        # 判据是**当前是否联网**（`self._networked`），不是词条的来源。
+        #
+        # 曾经这里写的是 `entry.source == "offline"`，而兜底产出的词条
+        # 来源**也是** "offline"——于是用户在接口模式下遇到接口失败、
+        # 拿到一条兜底内容时，看到的出路是「可在设置中切到接口模式」，
+        # 而他本来就在接口模式里。那句话让他去开一个已经开着的开关。
+        #
+        # 「来源是离线」与「用户选了离线」是两件事：前者说明这条内容
+        # 从哪来，后者才决定出路该怎么给。`set_networked` 的说明早就
+        # 写对了这件事，只是渲染时没用它。
+        if self._networked:
+            text = f"此词条不完整，缺少：{'、'.join(missing)}　可点下方「重新查询」"
+        else:
+            # 离线模式：重查还是同一本词典，让用户白点一次不如直说怎么补
+            text = (
+                f"此词条不完整，缺少：{'、'.join(missing)}　"
+                "离线词库只为常用词配例句，需要补全可在设置中切到接口模式"
+            )
+        warn = QLabel(text)
+        warn.setObjectName("warn")
+        warn.setWordWrap(True)
+        inner.addWidget(warn)
+        self._warn_label = warn
+
+    def _add_stale_hint(self, inner: QVBoxLayout, entry: Entry) -> None:
+        """提示词版本落后的提示。
+
+        与「不完整」分开说，因为两者性质不同：缺项是接口这次没给全，版本落后是
+        这条内容本身按旧标准生成。只提示、不自动重查——自动重查会在离线时把
+        「内容可能是旧的」变成「连旧的都看不到了」。
+        """
+        if not getattr(entry, "prompt_stale", False):
+            return
+        # 版本 0 表示来源不明（正常写入路径不会产生），写成「v0」会让用户
+        # 以为存在过一个叫 v0 的提示词。宁可说清楚是「未知」。
+        was = (
+            f"v{int(entry.prompt_version)}"
+            if int(entry.prompt_version or 0) > 0
+            else "来源未知"
+        )
+        stale = QLabel(
+            f"此词条由旧版提示词生成（{was} → v{PROMPT_VERSION}），"
+            "内容可能未按当前标准　可点下方「重新查询」更新"
+        )
+        stale.setObjectName("warn")
+        stale.setWordWrap(True)
+        inner.addWidget(stale)
+        self._stale_label = stale
+
+    def _add_body(
+        self, inner: QVBoxLayout, entry: Entry, collected: list[str] | None
+    ) -> None:
+        """释义、同义语、固定搭配、已收藏词组、例句。"""
+        self._add_section(inner, "英", entry.definition_en)
+        self._add_section(inner, "中", entry.definition_zh)
+
+        if entry.synonyms:
+            inner.addSpacing(4)
+            inner.addWidget(_section_title(f"同义语　{len(entry.synonyms)} 个"))
+            # 先把整批行建好再统一 chip 宽度，之后才挂进布局：
+            # 等宽是「这批词」的属性，一行一行建就只能各自为政。
+            synonym_rows = [self._build_synonym_row(syn) for syn in entry.synonyms]
+            self._equalize_chips(synonym_rows)
+            for row in synonym_rows:
+                inner.addLayout(row)
+
+        # 固定搭配。位置排在例句**之前**：例句说的是「这个词」，搭配说的是
+        # 「这个词怎么用」，后者才是查词时真正要解决的事。
+        #
+        # 整块不渲染的条件只是「没有搭配」，**不按来源分叉**：离线词库结构上
+        # 就没有这一块，那种情况由缺项提示如实说出来（缺项名单里含
+        # 「固定搭配」），而不是在这里再判一次来源——两处判同一件事，
+        # 迟早会有一处忘了改。
+        if entry.collocations:
+            inner.addSpacing(4)
+            inner.addWidget(_section_title(f"固定搭配　{len(entry.collocations)} 条"))
+            for coll in entry.collocations:
+                inner.addWidget(self._build_collocation_block(entry, coll))
+
+        # 已经收藏过的、含这个词的词组。纯本地查询，用来回答「这个词我到底
+        # 攒过哪些搭配」——它和上面那批是两回事：上面是接口刚给的，这里是
+        # 用户自己收的。
+        if collected:
+            inner.addSpacing(4)
+            inner.addWidget(_section_title("已收藏的含本词的词组"))
+            label = QLabel("、".join(collected))
+            label.setObjectName("muted")
+            label.setWordWrap(True)
+            inner.addWidget(label)
+            self._collected_label = label
+
+        if entry.example:
+            inner.addSpacing(4)
+            inner.addWidget(_section_title("例句"))
+            example = QLabel(entry.example)
+            example.setObjectName("body")
+            example.setWordWrap(True)
+            inner.addWidget(example)
+            if entry.example_zh:
+                example_zh = QLabel(entry.example_zh)
+                example_zh.setObjectName("muted")
+                example_zh.setWordWrap(True)
+                inner.addWidget(example_zh)
+
+    def _add_user_fields(self, inner: QVBoxLayout, entry: Entry) -> None:
+        """备注与标签，两者都自动保存。"""
+        inner.addSpacing(6)
+        inner.addWidget(_section_title("备注"))
+        self._note_edit = QPlainTextEdit()
+        self._note_edit.setPlainText(entry.notes or "")
+        self._note_edit.setPlaceholderText("为这个词写点什么…（自动保存）")
+        self._note_edit.setFixedHeight(66)
+        self._note_edit.textChanged.connect(self._on_note_changed)
+        inner.addWidget(self._note_edit)
+
+        # 标签。**这一行就是 `tags` 字段的全部入口**——在此之前它贯通了模型、
+        # 数据库、FTS（权重 3.0，与备注同级）与导出，但界面上没有任何地方能
+        # 编辑它，于是那一档权重永远挂在一个恒为空的列上。
+        #
+        # 值与用户输入之间必须过一道 `join_tags`：写进库里的形态只能是单空格
+        # 分隔，否则按标签筛选就退化成子串匹配（筛「考研」带出「考研英语」）。
+        inner.addSpacing(4)
+        inner.addWidget(_section_title("标签"))
+        self._tag_edit = QLineEdit(join_tags(entry.tags))
+        self._tag_edit.setPlaceholderText("用空格或逗号分隔，例如：考研 高频（自动保存）")
+        self._tag_edit.setToolTip("给这个词分类；左栏可以按标签筛选。")
+        self._tag_edit.textChanged.connect(self._on_tags_changed)
+        inner.addWidget(self._tag_edit)
 
     def _build_collocation_block(self, entry: Entry, coll) -> QWidget:
         """一条固定搭配：词组 + 中文简释 + 收藏按钮，下面配它自己的例句。

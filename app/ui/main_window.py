@@ -185,6 +185,17 @@ class MainWindow(QMainWindow):
         self.repo = repo
         self.service = service
         self.config = config
+        self._init_edit_state()
+        self._init_view_state()
+        self._init_background_state()
+        self._init_import_state()
+        self._init_refresh_state()
+        self._init_tray_state()
+        self._init_stats_state()
+        self._start()
+
+    def _init_edit_state(self) -> None:
+        """自动保存、撤销与筛选的待写值。"""
         self._pending_note: tuple[int, str] | None = None
         # 标签与备注走同一条自动保存通道，但各自记一份待写值：用户完全可能
         # 改了备注又改标签，两者都在防抖窗口里等着落库。
@@ -200,6 +211,9 @@ class MainWindow(QMainWindow):
         # 词组——两者是两张各自从 1 发号的表，同一个数字在两边是两条毫不相干
         # 的数据（详见 db.DDL 里 phrases 的建表注释）。
         self._last_deleted: tuple[str, object] | None = None
+
+    def _init_view_state(self) -> None:
+        """左栏看哪个集合，以及详情区的渲染去重状态。"""
         # 左栏此刻在看哪个集合：生词本还是词组收藏。列表、搜索、排序、导出
         # 全都按它分派——**只有一处判据**，各处各判一次必然有一处会忘。
         self._mode = MODE_WORDS
@@ -213,6 +227,8 @@ class MainWindow(QMainWindow):
         # 会抛 RuntimeError，而这条路径恰好在「删完一条接着重载」时必经。
         self._selected_card: EntryCard | None = None
 
+    def _init_background_state(self) -> None:
+        """背景图与当前主题。"""
         # 背景图。状态挂在这里而不是每帧现读配置：paintEvent 会被调很多次，
         # 每次都去读文件等于每次重绘都碰一次磁盘。
         self._background = BackgroundRenderer()
@@ -222,11 +238,15 @@ class MainWindow(QMainWindow):
         self._background_ok = False
         # 当前主题。窗口自己也应用一次（而不是只依赖 main.py 启动时设过），
         # 这样自检 / 截图脚本直接构造 MainWindow 时拿到的也是正确的配色。
-        self._theme = theme_id_of(config.get("theme"))
+        self._theme = theme_id_of(self.config.get("theme"))
 
-        # 导入状态。这些必须挂在实例上而不是藏在某一层的闭包里：整批导入
-        # 被拆成多次后台往返（见 IMPORT_BATCH），每批回来都要接着上一批的
-        # 账继续记，而每次往返之间事件循环是活的。
+    def _init_import_state(self) -> None:
+        """导入的跨批次账目。
+
+        这些必须挂在实例上而不是藏在某一层的闭包里：整批导入被拆成多次后台
+        往返（见 IMPORT_BATCH），每批回来都要接着上一批的账继续记，而每次往返
+        之间事件循环是活的。
+        """
         self._import_queue: list[ParsedWord] = []
         self._import_total = 0
         self._import_done = 0
@@ -240,10 +260,13 @@ class MainWindow(QMainWindow):
         # 以为程序自己去读了个文件。
         self._import_origin = "导入"
 
-        # 批量重查状态。与导入那套分开记：一次重查每条都要一次接口往返，
-        # 没法按批合并；而且两者的「失败」含义完全不同——导入的失败是
-        # 「这个词没进来」，重查的失败是「这一条保持原样」。混用一套计数，
-        # 报告里就会把这两种事说成同一件。
+    def _init_refresh_state(self) -> None:
+        """批量重查的账目。与导入那套分开记。
+
+        一次重查每条都要一次接口往返，没法按批合并；而且两者的「失败」含义
+        完全不同——导入的失败是「这个词没进来」，重查的失败是「这一条保持
+        原样」。混用一套计数，报告里就会把这两种事说成同一件。
+        """
         self._refresh_queue: list[tuple[int, str]] = []
         self._refresh_total = 0
         self._refresh_done = 0
@@ -252,20 +275,27 @@ class MainWindow(QMainWindow):
         self._refresh_cancelled = False
         self._refresh_progress: QProgressDialog | None = None
 
-        # 托盘与全局热键。`_quitting` 区分「关掉窗口」与「真的退出」：
-        # 有托盘时前者只是藏起来（热键才能随时唤出），后者必须真的结束进程。
-        # 没有这个开关，托盘菜单里的「退出」会走同一条 close() 路径，于是
-        # 用户点了退出、窗口消失、进程还在——一个再也打不开的常驻程序。
+    def _init_tray_state(self) -> None:
+        """托盘与全局热键。
+
+        `_quitting` 区分「关掉窗口」与「真的退出」：有托盘时前者只是藏起来
+        （热键才能随时唤出），后者必须真的结束进程。没有这个开关，托盘菜单里的
+        「退出」会走同一条 close() 路径，于是用户点了退出、窗口消失、进程还在
+        ——一个再也打不开的常驻程序。
+        """
         self._quitting = False
         self._tray: QSystemTrayIcon | None = None
         self._tray_menu: QMenu | None = None
         self._hotkey: GlobalHotkey | None = None
         self._tray_hinted = False
 
-        # 统计用的一次性状态。三类信息都只在「刚发生的那一次操作」里有意义：
-        #   起点时间（算耗时）、是否失败（算成功率）、来源（手动还是剪贴板）。
-        # 放在窗口上而不是参数里传：回调是异步的，经 submit 绕一圈回来时
-        # 已经没有调用栈可以带参数了。
+    def _init_stats_state(self) -> None:
+        """统计用的一次性状态。
+
+        三类信息都只在「刚发生的那一次操作」里有意义：起点时间（算耗时）、
+        是否失败（算成功率）、来源（手动还是剪贴板）。放在窗口上而不是参数里
+        传：回调是异步的，经 submit 绕一圈回来时已经没有调用栈可以带参数了。
+        """
         self._lookup_started = 0.0
         self._lookup_failed = False
         self._op_name = "lookup"
@@ -274,6 +304,8 @@ class MainWindow(QMainWindow):
         # 为 None 时（自检、截图脚本直接构造窗口）按钮不出现。
         self.restore_hook = None
 
+    def _start(self) -> None:
+        """窗口外观、界面装配与启动序列。顺序有依赖，见各步注释。"""
         self.setWindowTitle("Quill · 英语生词本")
         self.resize(1080, 700)
         self.setMinimumSize(760, 520)
@@ -672,6 +704,13 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(16, 14, 16, 8)
         root.setSpacing(12)
 
+        self._build_top_bar(root)
+        root.addWidget(self._build_splitter(), 1)
+        self.setCentralWidget(central)
+        self._build_status_bar()
+
+    def _build_top_bar(self, root: QVBoxLayout) -> None:
+        """顶部一行：输入框、主操作、常规与次要三档按钮。"""
         self.input = QLineEdit()
         self.input.setPlaceholderText("输入英语单词，回车查询并收藏")
         self.input.setMinimumHeight(33)
@@ -714,15 +753,89 @@ class MainWindow(QMainWindow):
         top.addWidget(self.btn_settings)
         root.addLayout(top)
 
+    def _build_splitter(self) -> QSplitter:
+        """左栏与详情区分列，比例 3:5。"""
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(10)
+        self.splitter.addWidget(self._build_left_panel())
+        self.splitter.addWidget(self._build_detail_panel())
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 5)
+        self.splitter.setSizes([350, 690])
+        return self.splitter
 
+    def _build_left_panel(self) -> QWidget:
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
+        left_layout.addLayout(self._build_mode_row())
+        left_layout.addLayout(self._build_review_row())
+        left_layout.addLayout(self._build_filter_row())
+        left_layout.addWidget(self._build_tag_row())
+        left_layout.addWidget(self._build_list(), 1)
+        left_layout.addWidget(self._build_count_label())
+        return left
 
+    def _build_mode_row(self) -> QHBoxLayout:
+        """「生词本 / 词组收藏」切换。两个可勾选按钮，而不是 QTabBar。
+
+        左栏很窄，标签页的页眉会白吃一行高度，而这里要表达的只是一个
+        「在哪个集合里」。`setAutoExclusive` 保证永远恰好一个选中——互斥交给
+        Qt，别在回调里手动一个个 setChecked（漏一处就会出现「两个都亮着」）。
+
+        计数写进按钮文本：词组收藏是用户一条条攒出来的，他在生词本模式下也该
+        看得见自己攒了多少；不写的话那一栏在他心里等于不存在。
+        """
+        self.btn_mode_words = QPushButton()
+        self.btn_mode_phrases = QPushButton()
+        for button in (self.btn_mode_words, self.btn_mode_phrases):
+            button.setObjectName("mode")
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_mode_words.setToolTip("查词收下来的词条")
+        self.btn_mode_phrases.setToolTip("从右侧「固定搭配」区收藏下来的词组")
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(2)
+        mode_row.addWidget(self.btn_mode_words)
+        mode_row.addWidget(self.btn_mode_phrases)
+        mode_row.addStretch(1)
+        return mode_row
+
+    def _build_review_row(self) -> QHBoxLayout:
+        """「待复习」与「重查全部」同处一行、左右分列。
+
+        两者都是「拿当前这一栏的内容做一件事」，放在一起比塞进顶部工具栏
+        更贴近它们的作用范围。
+        """
+        # 文本随时更新为到期条数（`_refresh_review_count`），点击打开复习会话。
+        # 只在生词本模式下有意义——词组没有复习列，切过去就隐藏。
+        self.btn_review = QPushButton("待复习 0")
+        self.btn_review.setObjectName("review")
+        self.btn_review.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_review.setToolTip(
+            "开始复习到期词条：正面看词、翻面看义，再按「忘了 / 模糊 / 记住了」"
+            "评分推进记忆计划"
+        )
+        self.btn_refresh_all = QPushButton("重查全部")
+        self.btn_refresh_all.setObjectName("refresh")
+        self.btn_refresh_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_refresh_all.setToolTip(
+            "按当前接口把列表里的词条重新查一遍。已写的备注与标签保留，"
+            "接口没答上来的词条保持原样。"
+        )
+
+        review_row = QHBoxLayout()
+        review_row.setSpacing(6)
+        review_row.addWidget(self.btn_review)
+        review_row.addStretch(1)
+        review_row.addWidget(self.btn_refresh_all)
+        return review_row
+
+    def _build_filter_row(self) -> QHBoxLayout:
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("搜索生词本（支持中文）")
         self.filter.setClearButtonEnabled(True)
@@ -740,13 +853,17 @@ class MainWindow(QMainWindow):
         filter_row.setSpacing(6)
         filter_row.addWidget(self.filter, 1)
         filter_row.addWidget(self.order)
+        return filter_row
 
-        # 标签筛选。做成一行的下拉而不是一排 chip：左栏宽度是固定的（拖一下
-        # 分割条，详情区就跟着缩），chip 排不下时只能裁剪或横向滚动——裁剪等于
-        # 让某些标签**无声消失**，而滚动条在一个 30px 高的行里既难用又难发现。
-        # 标签一多，下拉反而是唯一诚实的形态。
-        #
-        # 没有标签时整行隐藏：一个永远只有「全部标签」一项的下拉是在占位。
+    def _build_tag_row(self) -> QWidget:
+        """标签筛选。做成一行的下拉而不是一排 chip。
+
+        左栏宽度是固定的（拖一下分割条，详情区就跟着缩），chip 排不下时只能
+        裁剪或横向滚动——裁剪等于让某些标签**无声消失**，而滚动条在一个 30px
+        高的行里既难用又难发现。标签一多，下拉反而是唯一诚实的形态。
+
+        没有标签时整行隐藏：一个永远只有「全部标签」一项的下拉是在占位。
+        """
         self.tag_row = QWidget()
         tag_layout = QHBoxLayout(self.tag_row)
         tag_layout.setContentsMargins(0, 0, 0, 0)
@@ -759,7 +876,9 @@ class MainWindow(QMainWindow):
         self.tag_filter.setToolTip("只看带某个标签的词条；与搜索框同时生效。")
         tag_layout.addWidget(self.tag_filter, 1)
         self.tag_row.setVisible(False)
+        return self.tag_row
 
+    def _build_list(self) -> QListWidget:
         self.list = QListWidget()
         self.list.setUniformItemSizes(True)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -767,68 +886,17 @@ class MainWindow(QMainWindow):
         # 卡片上，就得再套一层容器，行高也不再等于卡片高度，uniformItemSizes 的
         # 一致性假设会被打破。
         self.list.setSpacing(6)
+        return self.list
 
+    def _build_count_label(self) -> QLabel:
         self.count_label = QLabel("共 0 条")
         # 自带一个对象名（而不是复用 #muted）：配了背景图时，它需要单独垫一层
         # 底——它不在面板里、也没有列表那样的轨道衬底，字是直接压在原图上的。
         # 复用 #muted 的话，垫底会把面板里每个次要标签也垫上一块白药丸。
         self.count_label.setObjectName("countLabel")
+        return self.count_label
 
-        # 「生词本 / 词组收藏」切换。两个可勾选按钮，而不是 QTabBar：左栏很窄，
-        # 标签页的页眉会白吃一行高度，而这里要表达的只是一个「在哪个集合里」。
-        # `setAutoExclusive` 保证永远恰好一个选中——互斥交给 Qt，别在回调里
-        # 手动一个个 setChecked（漏一处就会出现「两个都亮着」）。
-        #
-        # 计数写进按钮文本：词组收藏是用户一条条攒出来的，他在生词本模式下也该
-        # 看得见自己攒了多少；不写的话那一栏在他心里等于不存在。
-        self.btn_mode_words = QPushButton()
-        self.btn_mode_phrases = QPushButton()
-        for button in (self.btn_mode_words, self.btn_mode_phrases):
-            button.setObjectName("mode")
-            button.setCheckable(True)
-            button.setAutoExclusive(True)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_mode_words.setToolTip("查词收下来的词条")
-        self.btn_mode_phrases.setToolTip("从右侧「固定搭配」区收藏下来的词组")
-
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(2)
-        mode_row.addWidget(self.btn_mode_words)
-        mode_row.addWidget(self.btn_mode_phrases)
-        mode_row.addStretch(1)
-
-        # 「待复习」入口。文本随时更新为到期条数（`_refresh_review_count`），点击
-        # 打开复习会话。只在生词本模式下有意义——词组没有复习列，切过去就隐藏。
-        self.btn_review = QPushButton("待复习 0")
-        self.btn_review.setObjectName("review")
-        self.btn_review.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_review.setToolTip(
-            "开始复习到期词条：正面看词、翻面看义，再按「忘了 / 模糊 / 记住了」"
-            "评分推进记忆计划"
-        )
-        # 「重查全部」与「待复习」同处一行、左右分列：两者都是「拿当前这一栏
-        # 的内容做一件事」，放在一起比塞进顶部工具栏更贴近它们的作用范围。
-        self.btn_refresh_all = QPushButton("重查全部")
-        self.btn_refresh_all.setObjectName("refresh")
-        self.btn_refresh_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_refresh_all.setToolTip(
-            "按当前接口把列表里的词条重新查一遍。已写的备注与标签保留，"
-            "接口没答上来的词条保持原样。"
-        )
-
-        review_row = QHBoxLayout()
-        review_row.setSpacing(6)
-        review_row.addWidget(self.btn_review)
-        review_row.addStretch(1)
-        review_row.addWidget(self.btn_refresh_all)
-
-        left_layout.addLayout(mode_row)
-        left_layout.addLayout(review_row)
-        left_layout.addLayout(filter_row)
-        left_layout.addWidget(self.tag_row)
-        left_layout.addWidget(self.list, 1)
-        left_layout.addWidget(self.count_label)
-
+    def _build_detail_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("panel")
         panel_layout = QVBoxLayout(panel)
@@ -836,22 +904,18 @@ class MainWindow(QMainWindow):
         self.detail = EntryDetail()
         self.detail.set_networked(self._is_networked())
         panel_layout.addWidget(self.detail)
+        return panel
 
-        self.splitter.addWidget(left)
-        self.splitter.addWidget(panel)
-        self.splitter.setStretchFactor(0, 3)
-        self.splitter.setStretchFactor(1, 5)
-        self.splitter.setSizes([350, 690])
+    def _build_status_bar(self) -> None:
+        """接入状态常驻右下角，撤销按钮也在这里。
 
-        root.addWidget(self.splitter, 1)
-        self.setCentralWidget(central)
+        接入状态用 addPermanentWidget 而不是 showMessage：showMessage 会被每次
+        查询结果覆盖，用户最需要看到它的时候恰好看不到。
 
-        # 接入状态常驻在右下角。用 addPermanentWidget 而不是 showMessage：
-        # showMessage 会被每次查询结果覆盖，用户最需要看到它的时候恰好看不到。
-        #
-        # 「撤销删除」也放在这个永久区，而且**必须**是这里：showMessage 的临时
-        # 消息会把普通区（addWidget）的控件整个盖住，于是「已删除「X」」一出现，
-        # 撤销按钮就跟着消失——它恰好只在那一刻有用。
+        「撤销删除」**必须**在永久区：showMessage 的临时消息会把普通区
+        （addWidget）的控件整个盖住，于是「已删除「X」」一出现，撤销按钮就跟着
+        消失——它恰好只在那一刻有用。
+        """
         self.btn_undo = QPushButton("撤销删除")
         self.btn_undo.setObjectName("statusButton")
         self.btn_undo.setToolTip("把刚刚删掉的那条放回去（词条含备注与标签，词组含简释与例句）")

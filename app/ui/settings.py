@@ -473,7 +473,15 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
+        self._build_bg_picker(layout, config)
+        self._build_bg_recent(layout, config)
+        self._build_bg_blur(layout, config)
+        self._build_bg_veil(layout, config)
+        self._build_bg_preview(layout)
+        self._wire_background()
+        return holder
 
+    def _build_bg_picker(self, layout: QVBoxLayout, config: dict) -> None:
         picker = QHBoxLayout()
         picker.setSpacing(6)
         self.background = QLineEdit(str(config.get("background_image", "") or ""))
@@ -486,9 +494,14 @@ class SettingsDialog(QDialog):
         picker.addWidget(self.btn_clear)
         layout.addLayout(picker)
 
-        # 「最近使用」：换图不该每次从文件对话框从头翻。只列文件名，完整路径放
-        # 悬停提示里——不然一个长路径会把这一行撑爆。
-        recent = [str(p) for p in (config.get("background_recent") or []) if str(p).strip()]
+    def _build_bg_recent(self, layout: QVBoxLayout, config: dict) -> None:
+        """「最近使用」：换图不该每次从文件对话框从头翻。
+
+        只列文件名，完整路径放悬停提示里——不然一个长路径会把这一行撑爆。
+        """
+        recent = [
+            str(p) for p in (config.get("background_recent") or []) if str(p).strip()
+        ]
         recent_row = QHBoxLayout()
         recent_row.setSpacing(6)
         recent_row.addWidget(QLabel("最近使用"))
@@ -504,6 +517,7 @@ class SettingsDialog(QDialog):
         recent_row.addWidget(self.bg_recent, 1)
         layout.addLayout(recent_row)
 
+    def _build_bg_blur(self, layout: QVBoxLayout, config: dict) -> None:
         self.bg_blur = QCheckBox("加模糊蒙版（背景更含蓄，不跟正文抢注意力）")
         self.bg_blur.setChecked(bool(config.get("background_blur", True)))
         self.bg_blur.setToolTip(
@@ -512,9 +526,13 @@ class SettingsDialog(QDialog):
         )
         layout.addWidget(self.bg_blur)
 
-        # 「透出多少」必须给用户自己挑：同一张图放在深色照片上和浅色插画上，
-        # 合适的浓度差得很远，而程序猜不准。默认取中间档——第一版把最含蓄的
-        # 那一档写死，结果是「图几乎看不见」，等于功能没做（见 theme 的档位表）。
+    def _build_bg_veil(self, layout: QVBoxLayout, config: dict) -> None:
+        """「透出多少」必须给用户自己挑。
+
+        同一张图放在深色照片上和浅色插画上，合适的浓度差得很远，而程序猜不准。
+        默认取中间档——第一版把最含蓄的那一档写死，结果是「图几乎看不见」，
+        等于功能没做（见 theme 的档位表）。
+        """
         veil_row = QHBoxLayout()
         veil_row.setSpacing(6)
         veil_row.addWidget(QLabel("背景透出"))
@@ -535,8 +553,12 @@ class SettingsDialog(QDialog):
         veil_row.addWidget(self.bg_veil, 1)
         layout.addLayout(veil_row)
 
-        # 预览条：缩放 / 模糊 / 蒙版三步与真实窗口完全同一条流水线（同一个
-        # BackgroundRenderer），所以它演示的不是「大概」，而是窗口里那一块的样子。
+    def _build_bg_preview(self, layout: QVBoxLayout) -> None:
+        """预览条：缩放 / 模糊 / 蒙版三步与真实窗口完全同一条流水线。
+
+        用的是同一个 BackgroundRenderer，所以它演示的不是「大概」，而是窗口里
+        那一块的样子。
+        """
         self._preview_renderer = BackgroundRenderer()
         self._preview_path: str | None = None
         self._bg_preview = QLabel()
@@ -549,6 +571,7 @@ class SettingsDialog(QDialog):
         self._bg_note.setWordWrap(True)
         layout.addWidget(self._bg_note)
 
+    def _wire_background(self) -> None:
         self.btn_browse.clicked.connect(self._pick_background)
         self.btn_clear.clicked.connect(lambda: self.background.setText(""))
         self.bg_recent.currentIndexChanged.connect(self._on_recent_picked)
@@ -556,7 +579,6 @@ class SettingsDialog(QDialog):
         self.bg_blur.toggled.connect(lambda _: self._sync_background())
         self.bg_veil.currentIndexChanged.connect(lambda _: self._sync_background())
         self._sync_background()
-        return holder
 
     def _on_recent_picked(self) -> None:
         path = self.bg_recent.currentData()
